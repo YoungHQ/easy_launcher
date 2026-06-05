@@ -9,6 +9,7 @@ mod selection;
 mod selection_trigger;
 mod storage;
 mod tools;
+mod updates;
 
 use ai::{
     build_ai_request_messages, list_openai_compatible_models, merge_ai_params,
@@ -51,6 +52,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, Windo
 use tauri::{PhysicalPosition, PhysicalSize};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tools::{sanitize_password_options, PasswordOptions};
+use updates::UpdateCheckResult;
 
 const LAUNCHER_SHORTCUT_LABEL: &str = "Alt+1";
 const AI_SHORTCUT_LABEL: &str = "Alt+3";
@@ -123,6 +125,9 @@ const EXPORTABLE_SETTING_KEYS: &[&str] = &[
     "tools.password.underscore",
     "tools.password.special",
     "tools.password.brackets",
+    "updates.check.enabled",
+    "updates.check.interval_hours",
+    "updates.check.include_prerelease",
 ];
 
 #[derive(Clone, Serialize)]
@@ -239,6 +244,25 @@ struct SearchProgressEvent {
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {name}. Tauri backend is connected.")
+}
+
+#[tauri::command]
+fn get_app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
+async fn check_for_updates(app: AppHandle, include_prerelease: bool) -> UpdateCheckResult {
+    updates::check_for_updates(&app.package_info().version.to_string(), include_prerelease).await
+}
+
+#[tauri::command]
+fn open_update_release_page(url: String) -> Result<(), String> {
+    if !updates::is_allowed_release_url(&url) {
+        return Err("Release 链接无效".into());
+    }
+
+    open_url(&url)
 }
 
 #[tauri::command]
@@ -3239,7 +3263,9 @@ fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
         | "tools.password.hyphen"
         | "tools.password.underscore"
         | "tools.password.special"
-        | "tools.password.brackets" => {
+        | "tools.password.brackets"
+        | "updates.check.enabled"
+        | "updates.check.include_prerelease" => {
             if matches!(value.trim(), "true" | "false") {
                 Ok(())
             } else {
@@ -3256,6 +3282,10 @@ fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
         | "search.weight.tools" => parse_weight(value).map(|_| ()),
         "tools.menu.alias" => validate_tool_menu_alias(value),
         "tools.password.length" => parse_password_length(value).map(|_| ()),
+        "updates.check.interval_hours" => parse_update_interval_hours(value).map(|_| ()),
+        "updates.check.last_checked_at"
+        | "updates.check.last_seen_tag"
+        | "updates.check.dismissed_tag" => Ok(()),
         "file.editor.path" | "folder.editor.path" => validate_optional_existing_path(value),
         "everything.exe.path" => validate_everything_exe_path(value),
         _ => Ok(()),
@@ -3597,6 +3627,18 @@ fn parse_password_length(value: &str) -> Result<usize, String> {
         Ok(length)
     } else {
         Err("密码长度必须在 4 到 128 之间".into())
+    }
+}
+
+fn parse_update_interval_hours(value: &str) -> Result<u32, String> {
+    let hours = value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "更新检查间隔必须是数字".to_string())?;
+    if (1..=720).contains(&hours) {
+        Ok(hours)
+    } else {
+        Err("更新检查间隔必须在 1 到 720 小时之间".into())
     }
 }
 
@@ -4069,6 +4111,7 @@ pub fn run() {
             cancel_ai_action,
             cancel_ai_chat_message,
             capture_selection,
+            check_for_updates,
             copy_file_to_clipboard,
             copy_path,
             delete_path,
@@ -4083,6 +4126,7 @@ pub fn run() {
             fetch_ai_provider_models,
             get_setting,
             get_pending_selection_capture,
+            get_app_version,
             get_password_options,
             get_search_source_settings,
             get_search_weight_settings,
@@ -4106,6 +4150,7 @@ pub fn run() {
             open_parent_dir,
             open_shortcut_target_parent,
             open_terminal_at_path,
+            open_update_release_page,
             import_config,
             open_everything_download,
             reveal_path,
@@ -4354,6 +4399,17 @@ mod tests {
         assert!(validate_import_setting("everything.search.full_path", "true").is_ok());
         assert!(validate_import_setting("everything.search.content", "false").is_ok());
         assert!(validate_import_setting("everything.search.content", "yes").is_err());
+    }
+
+    #[test]
+    fn update_check_settings_export_and_import_validation_are_supported() {
+        assert!(EXPORTABLE_SETTING_KEYS.contains(&"updates.check.enabled"));
+        assert!(EXPORTABLE_SETTING_KEYS.contains(&"updates.check.interval_hours"));
+        assert!(EXPORTABLE_SETTING_KEYS.contains(&"updates.check.include_prerelease"));
+        assert!(validate_import_setting("updates.check.enabled", "true").is_ok());
+        assert!(validate_import_setting("updates.check.include_prerelease", "false").is_ok());
+        assert!(validate_import_setting("updates.check.interval_hours", "24").is_ok());
+        assert!(validate_import_setting("updates.check.interval_hours", "0").is_err());
     }
 
     #[test]

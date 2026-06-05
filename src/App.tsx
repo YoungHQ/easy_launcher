@@ -274,6 +274,26 @@ type EverythingSearchOptions = {
   searchContent: boolean;
 };
 
+type UpdateCheckResult = {
+  currentVersion: string;
+  latestVersion?: string | null;
+  latestTag?: string | null;
+  releaseName?: string | null;
+  releaseUrl?: string | null;
+  publishedAt?: string | null;
+  isNewer?: boolean | null;
+  isPrerelease: boolean;
+  assetName?: string | null;
+  assetDownloadUrl?: string | null;
+  error?: string | null;
+};
+
+type UpdateStatusGuide = {
+  tone: "ok" | "warning" | "neutral";
+  title: string;
+  detail: string;
+};
+
 type ConfigExportResult = {
   path: string;
   settingCount: number;
@@ -393,7 +413,8 @@ type ErrorScope =
   | "配置"
   | "搜索"
   | "系统"
-  | "划词";
+  | "划词"
+  | "更新";
 
 type SettingsSection =
   | "general"
@@ -405,6 +426,7 @@ type SettingsSection =
   | "phrases"
   | "webSearch"
   | "exclusions"
+  | "updates"
   | "backup";
 
 type AppError = {
@@ -467,6 +489,7 @@ const settingsSections: { id: SettingsSection; label: string; meta: string }[] =
   { id: "phrases", label: "短语", meta: "常用文本" },
   { id: "webSearch", label: "网页", meta: "搜索模板" },
   { id: "exclusions", label: "隐藏", meta: "排除规则" },
+  { id: "updates", label: "更新", meta: "版本、Release" },
   { id: "backup", label: "配置", meta: "导入导出" },
 ];
 
@@ -580,6 +603,12 @@ function MainApp() {
       fullPath: false,
       searchContent: false,
     });
+  const [appVersion, setAppVersion] = useState("0.1.0");
+  const [includePrereleaseUpdates, setIncludePrereleaseUpdates] = useState(false);
+  const [lastUpdateCheckAt, setLastUpdateCheckAt] = useState<string | null>(null);
+  const [dismissedUpdateTag, setDismissedUpdateTag] = useState<string | null>(null);
+  const [updateCheckResult, setUpdateCheckResult] = useState<UpdateCheckResult | null>(null);
+  const [isCheckingUpdates, setIsCheckingUpdates] = useState(false);
   const [importPath, setImportPath] = useState("");
   const [customCommands, setCustomCommands] = useState<CustomCommand[]>([]);
   const [customCommandDraft, setCustomCommandDraft] = useState<CustomCommandDraft>({
@@ -745,6 +774,12 @@ function MainApp() {
       (profile) => !profile.enabled || !profile.baseUrl.trim() || !profile.modelName.trim(),
     );
   const everythingStatusGuide = everythingStatusGuideFromStatus(everythingStatus);
+  const updateStatusGuide = updateStatusGuideFromResult(
+    updateCheckResult,
+    isCheckingUpdates,
+    dismissedUpdateTag,
+    lastUpdateCheckAt,
+  );
 
   useEffect(() => {
     aiMessagesRef.current = aiMessages;
@@ -942,6 +977,7 @@ function MainApp() {
           key: "ui.language",
         });
         setLanguageOption(normalizeLanguagePreference(loadedLanguage));
+        await loadUpdateSettings();
         await loadAiData();
         const loadedSources = await invoke<SearchSourceSettings>("get_search_source_settings");
         setSearchSources(loadedSources);
@@ -1238,6 +1274,28 @@ function MainApp() {
       setBackendMessage("浏览器预览模式");
       showError("系统", "后端连接失败", error);
     }
+  }
+
+  async function loadUpdateSettings() {
+    try {
+      const version = await invoke<string>("get_app_version");
+      setAppVersion(version || "0.1.0");
+    } catch {
+      setAppVersion("0.1.0");
+    }
+
+    const includePrerelease = await invoke<string | null>("get_setting", {
+      key: "updates.check.include_prerelease",
+    });
+    const lastCheckedAt = await invoke<string | null>("get_setting", {
+      key: "updates.check.last_checked_at",
+    });
+    const dismissedTag = await invoke<string | null>("get_setting", {
+      key: "updates.check.dismissed_tag",
+    });
+    setIncludePrereleaseUpdates(includePrerelease === "true");
+    setLastUpdateCheckAt(lastCheckedAt?.trim() || null);
+    setDismissedUpdateTag(dismissedTag?.trim() || null);
   }
 
   async function loadAiConversations(assistantId: string | null): Promise<AiConversation[]> {
@@ -1828,6 +1886,120 @@ function MainApp() {
     }
   }
 
+  async function toggleIncludePrereleaseUpdates() {
+    const nextEnabled = !includePrereleaseUpdates;
+    try {
+      await invoke("set_setting", {
+        key: "updates.check.include_prerelease",
+        value: String(nextEnabled),
+      });
+      setIncludePrereleaseUpdates(nextEnabled);
+      setUpdateCheckResult(null);
+      setActionMessage(nextEnabled ? "更新检查已包含预发布版本" : "更新检查已排除预发布版本");
+      clearError();
+    } catch (error) {
+      showError("更新", "更新检查偏好保存失败", error);
+    }
+  }
+
+  async function checkForUpdates() {
+    setIsCheckingUpdates(true);
+    try {
+      const result = await invoke<UpdateCheckResult>("check_for_updates", {
+        includePrerelease: includePrereleaseUpdates,
+      });
+      const checkedAt = new Date().toISOString();
+      setUpdateCheckResult(result);
+      setAppVersion(result.currentVersion || appVersion);
+      setLastUpdateCheckAt(checkedAt);
+      await invoke("set_setting", {
+        key: "updates.check.last_checked_at",
+        value: checkedAt,
+      }).catch(() => undefined);
+
+      if (result.error && !result.releaseUrl) {
+        showError("更新", "更新检查失败", result.error);
+        return;
+      }
+
+      if (result.isNewer) {
+        setActionMessage(`发现新版本：${result.latestTag ?? result.latestVersion}`);
+      } else if (result.error) {
+        setActionMessage(result.error);
+      } else {
+        setActionMessage("已是最新版本");
+      }
+      clearError();
+    } catch (error) {
+      showError("更新", "更新检查失败", error);
+    } finally {
+      setIsCheckingUpdates(false);
+    }
+  }
+
+  async function openLatestReleasePage() {
+    const releaseUrl = updateCheckResult?.releaseUrl;
+    if (!releaseUrl) {
+      showError("更新", "没有可打开的 Release 页面");
+      return;
+    }
+
+    try {
+      await invoke("open_update_release_page", { url: releaseUrl });
+      if (updateCheckResult?.latestTag) {
+        await invoke("set_setting", {
+          key: "updates.check.last_seen_tag",
+          value: updateCheckResult.latestTag,
+        }).catch(() => undefined);
+      }
+      setActionMessage("已打开 Release 页面");
+      clearError();
+    } catch (error) {
+      showError("更新", "打开 Release 页面失败", error);
+    }
+  }
+
+  async function copyUpdateDownloadUrl() {
+    const downloadUrl = updateCheckResult?.assetDownloadUrl;
+    if (!downloadUrl) {
+      showError("更新", "当前 Release 没有可复制的 MSI 下载链接");
+      return;
+    }
+
+    try {
+      await invoke("copy_path", { path: downloadUrl });
+      setActionMessage(`已复制下载链接：${updateCheckResult?.assetName ?? "MSI"}`);
+      clearError();
+    } catch (error) {
+      try {
+        await navigator.clipboard.writeText(downloadUrl);
+        setActionMessage(`已复制下载链接：${updateCheckResult?.assetName ?? "MSI"}`);
+        clearError();
+      } catch {
+        showError("更新", "复制下载链接失败", error);
+      }
+    }
+  }
+
+  async function dismissLatestUpdate() {
+    const latestTag = updateCheckResult?.latestTag;
+    if (!latestTag) {
+      return;
+    }
+
+    try {
+      await invoke("set_setting", {
+        key: "updates.check.dismissed_tag",
+        value: latestTag,
+      });
+      setDismissedUpdateTag(latestTag);
+      setActionMessage(`已忽略版本：${latestTag}`);
+      clearError();
+    } catch (error) {
+      showError("更新", "忽略版本失败", error);
+    }
+  }
+
   async function reloadSettings() {
     const shortcut = await invoke<string | null>("get_setting", {
       key: "launcher.shortcut",
@@ -1860,6 +2032,7 @@ function MainApp() {
     });
     setLanguageOption(normalizeLanguagePreference(loadedLanguage));
 
+    await loadUpdateSettings();
     await loadAiData();
 
     const loadedSources = await invoke<SearchSourceSettings>("get_search_source_settings");
@@ -4091,6 +4264,91 @@ function MainApp() {
                 </>
               ) : null}
 
+              {activeSettingsSection === "updates" ? (
+                <>
+                  <div className="settingsHeader">
+                    <strong>更新</strong>
+                    <small>当前版本 {appVersion}</small>
+                  </div>
+                  <div className={`updateStatusGuide ${updateStatusGuide.tone}`}>
+                    <strong>{updateStatusGuide.title}</strong>
+                    <span>{updateStatusGuide.detail}</span>
+                  </div>
+                  <div className="settingRow systemButtonRow">
+                    <span className="settingLabel">Release</span>
+                    <div className="systemButtonGroup">
+                      <button
+                        type="button"
+                        onClick={checkForUpdates}
+                        disabled={isCheckingUpdates}
+                      >
+                        {isCheckingUpdates ? "正在检查" : "检查更新"}
+                      </button>
+                      <button
+                        className="secondaryButton"
+                        type="button"
+                        onClick={openLatestReleasePage}
+                        disabled={!updateCheckResult?.releaseUrl}
+                      >
+                        打开 Release
+                      </button>
+                      <button
+                        className="secondaryButton"
+                        type="button"
+                        onClick={copyUpdateDownloadUrl}
+                        disabled={!updateCheckResult?.assetDownloadUrl}
+                      >
+                        复制 MSI 链接
+                      </button>
+                      <button
+                        className="secondaryButton"
+                        type="button"
+                        onClick={dismissLatestUpdate}
+                        disabled={
+                          !updateCheckResult?.latestTag ||
+                          !updateCheckResult?.isNewer ||
+                          dismissedUpdateTag === updateCheckResult.latestTag
+                        }
+                      >
+                        忽略此版本
+                      </button>
+                    </div>
+                  </div>
+                  <div className="settingRow settingButtonRow">
+                    <span className="settingLabel">预发布</span>
+                    <button
+                      className={includePrereleaseUpdates ? "sourceToggle active" : "sourceToggle"}
+                      type="button"
+                      aria-pressed={includePrereleaseUpdates}
+                      onClick={toggleIncludePrereleaseUpdates}
+                    >
+                      包含预发布{includePrereleaseUpdates ? "开" : "关"}
+                    </button>
+                  </div>
+                  <div className="updateMetaGrid">
+                    <span>
+                      <strong>最新版本</strong>
+                      <small>{updateCheckResult?.latestTag ?? "尚未检查"}</small>
+                    </span>
+                    <span>
+                      <strong>发布时间</strong>
+                      <small>
+                        {updateCheckResult?.publishedAt
+                          ? formatDateTime(updateCheckResult.publishedAt)
+                          : "未知"}
+                      </small>
+                    </span>
+                    <span>
+                      <strong>安装包</strong>
+                      <small>{updateCheckResult?.assetName ?? "暂无 MSI asset"}</small>
+                    </span>
+                  </div>
+                  <small className="settingsHint">
+                    更新检查只请求 GitHub Releases API；下载安装仍由用户从 Release 页面确认。
+                  </small>
+                </>
+              ) : null}
+
               {activeSettingsSection === "backup" ? (
                 <>
                   <div className="settingsHeader">
@@ -5364,8 +5622,8 @@ function fallbackResults(query: string): SearchResult[] {
     },
     {
       id: "fallback-file-plan",
-      title: "example.txt",
-      subtitle: "C:\\Users\\Public\\Documents\\example.txt",
+      title: "product-plan.md",
+      subtitle: "docs/archive/f1-flow/product-plan-f1-flow.md",
       kind: "file",
       action: "openFile",
       source: "文件",
@@ -5772,6 +6030,71 @@ function everythingStatusGuideFromStatus(
     detail: status.httpAvailable
       ? "IPC 搜索优先，HTTP 仅作为备用通道；可按需启用全路径或内容搜索。"
       : "IPC 搜索可用；HTTP 备用接口未开启，不影响默认文件搜索。",
+  };
+}
+
+function updateStatusGuideFromResult(
+  result: UpdateCheckResult | null,
+  checking: boolean,
+  dismissedTag: string | null,
+  lastCheckedAt: string | null,
+): UpdateStatusGuide {
+  if (checking) {
+    return {
+      tone: "neutral",
+      title: "正在检查更新",
+      detail: "正在读取 GitHub Releases 元数据。",
+    };
+  }
+
+  const lastChecked = lastCheckedAt ? `上次检查：${formatDateTime(lastCheckedAt)}` : "尚未检查";
+  if (!result) {
+    return {
+      tone: "neutral",
+      title: "尚未检查更新",
+      detail: `${lastChecked}。检查更新只访问 GitHub Releases API。`,
+    };
+  }
+
+  if (result.error && !result.releaseUrl) {
+    return {
+      tone: "warning",
+      title: "检查失败",
+      detail: result.error,
+    };
+  }
+
+  const latest = result.latestTag ?? result.latestVersion ?? "未知版本";
+  if (result.isNewer === true) {
+    if (dismissedTag === result.latestTag) {
+      return {
+        tone: "neutral",
+        title: `已忽略版本 ${latest}`,
+        detail: "本次不会再突出提醒；仍可打开 Release 页面查看。",
+      };
+    }
+
+    return {
+      tone: "warning",
+      title: `发现新版本 ${latest}`,
+      detail: result.assetName
+        ? `Release 已发布 MSI：${result.assetName}。`
+        : "Release 页面可查看版本说明；当前未发现 MSI asset。",
+    };
+  }
+
+  if (result.isNewer === false) {
+    return {
+      tone: "ok",
+      title: "已是最新版本",
+      detail: `当前版本 ${result.currentVersion}，最新 Release 为 ${latest}。`,
+    };
+  }
+
+  return {
+    tone: "warning",
+    title: "发现发布信息但无法比较",
+    detail: result.error ?? "Release tag 不是三段数字版本，可打开 Release 页面手动确认。",
   };
 }
 

@@ -807,6 +807,78 @@ button {
   color: var(--color-danger);
 }
 
+.updateStatusGuide {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface-subtle);
+  color: var(--color-muted-text);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.updateStatusGuide strong {
+  min-width: 0;
+  color: var(--color-text);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.updateStatusGuide span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.updateStatusGuide.ok {
+  border-color: rgba(99, 139, 195, 0.28);
+  background: var(--color-accent-soft);
+}
+
+.updateStatusGuide.warning {
+  border-color: rgba(185, 120, 104, 0.28);
+  background: var(--color-danger-soft);
+}
+
+.updateStatusGuide.warning strong {
+  color: var(--color-danger);
+}
+
+.updateMetaGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.updateMetaGrid span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 7px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-panel);
+}
+
+.updateMetaGrid strong,
+.updateMetaGrid small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.updateMetaGrid strong {
+  color: var(--color-text);
+  font-size: 11px;
+}
+
+.updateMetaGrid small {
+  color: var(--color-muted-text);
+  font-size: 11px;
+}
+
 .sourceToggle {
   min-height: 26px;
   padding: 0 6px;
@@ -2180,7 +2252,8 @@ button {
   }
 
   .sourceToggles,
-  .weightToggles {
+  .weightToggles,
+  .updateMetaGrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
