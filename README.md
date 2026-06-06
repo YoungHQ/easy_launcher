@@ -2,7 +2,7 @@
 
 Easy Launcher 是一个 Windows-first 桌面启动器。按下快捷键后，可以在一个紧凑输入框里搜索应用、文件、系统命令、网页搜索、快捷短语、计算结果和 AI 文本动作。
 
-更完整的产品说明见：[产品文档](product-html/index.html)。
+更完整的产品说明见：[产品文档](https://younghq.github.io/easy_launcher/)。
 
 ## 核心功能
 
