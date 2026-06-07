@@ -4,7 +4,7 @@ import type {
   MouseEvent as ReactMouseEvent,
   ReactNode,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -42,6 +42,7 @@ type SearchResult = {
   score: number;
   shortcut?: string;
   fileMetadata?: FileMetadata | null;
+  iconPath?: string | null;
 };
 
 type FileMetadata = {
@@ -369,8 +370,32 @@ type ExclusionRuleDraft = {
   pattern: string;
 };
 
+type PinnedResult = {
+  resultId: string;
+  kind: string;
+  title: string;
+  target: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type ResultAlias = {
+  alias: string;
+  normalizedAlias: string;
+  resultId: string;
+  kind: string;
+  title: string;
+  target: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type ResultContextActionId =
   | "execute"
+  | "pinResult"
+  | "unpinResult"
+  | "addAlias"
+  | "deleteAlias"
   | "openParent"
   | "revealPath"
   | "copyPath"
@@ -404,6 +429,27 @@ type ResultContextSession = {
 type SearchProgressEvent = {
   requestId: number;
   results: SearchResult[];
+};
+
+type SearchIconUpdate = {
+  resultId: string;
+  iconPath: string;
+};
+
+type SearchIconsUpdatedEvent = {
+  requestId: number;
+  icons: SearchIconUpdate[];
+};
+
+type IconCacheStatus = {
+  directory: string;
+  fileCount: number;
+  sizeBytes: number;
+};
+
+type IconCacheClearResult = {
+  clearedCount: number;
+  status: IconCacheStatus;
 };
 
 type ErrorScope =
@@ -442,7 +488,7 @@ const kindMarks: Record<ResultKind, string> = {
   command: ">",
   calculator: "=",
   aiAction: "AI",
-  webSearch: "W",
+  webSearch: "WEB",
   tool: "T",
 };
 
@@ -500,6 +546,8 @@ function App() {
 function MainApp() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
+  const [resultsRevision, setResultsRevision] = useState(0);
+  const resultIconPathsRef = useRef<Map<string, string>>(new Map());
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [backendMessage, setBackendMessage] = useState("后端未验证");
   const [shortcutStatus, setShortcutStatus] = useState<ShortcutStatus>({
@@ -514,6 +562,7 @@ function MainApp() {
   });
   const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
   const [everythingStatus, setEverythingStatus] = useState<EverythingStatus | null>(null);
+  const [iconCacheStatus, setIconCacheStatus] = useState<IconCacheStatus | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("launcher");
   const [storedShortcut, setStoredShortcut] = useState("Alt+1");
   const [shortcutInput, setShortcutInput] = useState("Alt+1");
@@ -632,6 +681,9 @@ function MainApp() {
     matchType: "result_id",
     pattern: "",
   });
+  const [pinnedResults, setPinnedResults] = useState<PinnedResult[]>([]);
+  const [resultAliases, setResultAliases] = useState<ResultAlias[]>([]);
+  const [smartRankingEnabled, setSmartRankingEnabled] = useState(true);
   const [actionMessage, setActionMessage] = useState("输入关键词搜索");
   const [appError, setAppError] = useState<AppError | null>(null);
   const [contextSession, setContextSession] = useState<ResultContextSession | null>(null);
@@ -926,6 +978,21 @@ function MainApp() {
     return isLatestSearchRequest(requestId) ? response : null;
   }
 
+  function setSearchResults(nextResults: SearchResult[]) {
+    setResults((current) => {
+      const resultIconPaths = resultIconPathsRef.current;
+      cacheResultIcons(current, resultIconPaths);
+      const mergedResults = mergeResultsPreservingIcons(
+        nextResults,
+        current,
+        resultIconPaths,
+      );
+      cacheResultIcons(mergedResults, resultIconPaths);
+      return mergedResults;
+    });
+    setResultsRevision((current) => current + 1);
+  }
+
   useEffect(() => {
     async function loadRuntimeStatus() {
       try {
@@ -950,11 +1017,13 @@ function MainApp() {
 
       try {
         const status = await invoke<StorageStatus>("storage_status");
+        const loadedIconCacheStatus = await invoke<IconCacheStatus>("icon_cache_status");
         const shortcut = await invoke<string | null>("get_setting", {
           key: "launcher.shortcut",
         });
 
         setStorageStatus(status);
+        setIconCacheStatus(loadedIconCacheStatus);
         setStoredShortcut(shortcut ?? "Alt+1");
         setShortcutInput(shortcut ?? "Alt+1");
         const triggerMode = await invoke<string | null>("get_setting", {
@@ -983,6 +1052,10 @@ function MainApp() {
         setSearchSources(loadedSources);
         const loadedWeights = await invoke<SearchWeightSettings>("get_search_weight_settings");
         setSearchWeights(loadedWeights);
+        const loadedSmartRanking = await invoke<string | null>("get_setting", {
+          key: "search.smart_ranking.enabled",
+        });
+        setSmartRankingEnabled(loadedSmartRanking !== "false");
         const loadedPasswordOptions = await invoke<PasswordOptions>("get_password_options");
         setPasswordOptions(loadedPasswordOptions);
         const loadedToolMenuAlias = await invoke<string | null>("get_setting", {
@@ -1006,6 +1079,10 @@ function MainApp() {
         setWebSearchTemplates(loadedWebSearchTemplates);
         const loadedExclusionRules = await invoke<ExclusionRule[]>("list_exclusion_rules");
         setExclusionRules(loadedExclusionRules);
+        const loadedPinnedResults = await invoke<PinnedResult[]>("list_pinned_results");
+        setPinnedResults(loadedPinnedResults);
+        const loadedResultAliases = await invoke<ResultAlias[]>("list_result_aliases");
+        setResultAliases(loadedResultAliases);
       } catch (error) {
         setStorageStatus(null);
         showError("配置", "本地设置读取失败", error);
@@ -1213,12 +1290,35 @@ function MainApp() {
         return;
       }
 
-      setResults(event.payload.results);
+      setSearchResults(event.payload.results);
       setSelectedIndex((current) =>
         Math.min(current, Math.max(event.payload.results.length - 1, 0)),
       );
       setActionMessage(event.payload.results.length > 0 ? "已补充文件结果" : "没有匹配结果");
       clearError();
+    }).then((handler) => {
+      unlisten = handler;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    listen<SearchIconsUpdatedEvent>("search-icons-updated", (event) => {
+      if (!isLatestSearchRequest(event.payload.requestId)) {
+        return;
+      }
+
+      setResults((current) => {
+        const mergedResults = mergeIconUpdates(current, event.payload.icons);
+        cacheResultIcons(mergedResults, resultIconPathsRef.current);
+        return mergedResults;
+      });
+      setResultsRevision((current) => current + 1);
     }).then((handler) => {
       unlisten = handler;
     });
@@ -1240,14 +1340,14 @@ function MainApp() {
       try {
         const response = await invokeSearchWithRecents(searchQuery, requestId);
         if (response !== null) {
-          setResults(response);
+          setSearchResults(response);
           setSelectedIndex(0);
           setActionMessage(response.length > 0 ? "Enter 执行，Esc 清空" : "没有匹配结果");
         }
       } catch (error) {
         if (isLatestSearchRequest(requestId)) {
           const fallback = fallbackResults(searchQuery);
-          setResults(fallback);
+          setSearchResults(fallback);
           setSelectedIndex(0);
           setActionMessage("浏览器预览模式，使用 mock 结果");
           showError("搜索", "搜索失败", error);
@@ -1822,22 +1922,61 @@ function MainApp() {
     }
   }
 
-  async function saveEditorPaths() {
+  async function saveEditorPaths(
+    nextFileEditorPath = fileEditorPath,
+    nextFolderEditorPath = folderEditorPath,
+  ) {
+    const normalizedFileEditorPath = nextFileEditorPath.trim();
+    const normalizedFolderEditorPath = nextFolderEditorPath.trim();
+
     try {
       await invoke("set_setting", {
         key: "file.editor.path",
-        value: fileEditorPath.trim(),
+        value: normalizedFileEditorPath,
       });
       await invoke("set_setting", {
         key: "folder.editor.path",
-        value: folderEditorPath.trim(),
+        value: normalizedFolderEditorPath,
       });
-      setFileEditorPath(fileEditorPath.trim());
-      setFolderEditorPath(folderEditorPath.trim());
+      setFileEditorPath(normalizedFileEditorPath);
+      setFolderEditorPath(normalizedFolderEditorPath);
       setActionMessage("编辑器路径已保存");
       clearError();
     } catch (error) {
       showError("配置", "编辑器路径保存失败", error);
+    }
+  }
+
+  async function chooseEditorPath(kind: "file" | "folder") {
+    try {
+      const selected = await open({
+        title: kind === "file" ? "选择文件编辑器" : "选择目录编辑器",
+        multiple: false,
+        directory: false,
+        filters: [
+          { name: "可执行文件", extensions: ["exe"] },
+          { name: "所有文件", extensions: ["*"] },
+        ],
+      });
+      if (!selected || Array.isArray(selected)) {
+        return;
+      }
+
+      if (kind === "file") {
+        await saveEditorPaths(selected, folderEditorPath);
+      } else {
+        await saveEditorPaths(fileEditorPath, selected);
+      }
+    } catch (error) {
+      showError("配置", kind === "file" ? "选择文件编辑器失败" : "选择目录编辑器失败", error);
+    }
+  }
+
+  async function clearEditorPath(kind: "file" | "folder") {
+    if (kind === "file") {
+      await saveEditorPaths("", folderEditorPath);
+    } else {
+      await saveEditorPaths(fileEditorPath, "");
     }
   }
 
@@ -2039,6 +2178,12 @@ function MainApp() {
     setSearchSources(loadedSources);
     const loadedWeights = await invoke<SearchWeightSettings>("get_search_weight_settings");
     setSearchWeights(loadedWeights);
+    const loadedSmartRanking = await invoke<string | null>("get_setting", {
+      key: "search.smart_ranking.enabled",
+    });
+    setSmartRankingEnabled(loadedSmartRanking !== "false");
+    const loadedIconCacheStatus = await invoke<IconCacheStatus>("icon_cache_status");
+    setIconCacheStatus(loadedIconCacheStatus);
     const loadedPasswordOptions = await invoke<PasswordOptions>("get_password_options");
     setPasswordOptions(loadedPasswordOptions);
     const loadedToolMenuAlias = await invoke<string | null>("get_setting", {
@@ -2067,6 +2212,10 @@ function MainApp() {
     setWebSearchTemplates(loadedWebSearchTemplates);
     const loadedExclusionRules = await invoke<ExclusionRule[]>("list_exclusion_rules");
     setExclusionRules(loadedExclusionRules);
+    const loadedPinnedResults = await invoke<PinnedResult[]>("list_pinned_results");
+    setPinnedResults(loadedPinnedResults);
+    const loadedResultAliases = await invoke<ResultAlias[]>("list_result_aliases");
+    setResultAliases(loadedResultAliases);
   }
 
   async function exportConfig() {
@@ -2093,7 +2242,7 @@ function MainApp() {
       await reloadSettings();
       const response = await invokeSearchWithRecents(query);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       setActionMessage(`已导入 ${result.importedCount} 项配置`);
       clearError();
@@ -2116,7 +2265,7 @@ function MainApp() {
       const response = await invokeSearchWithRecents(query);
       setCustomCommands(commands);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       setCustomCommandDraft({ name: "", commandType: "url", target: "" });
       setActionMessage("自定义命令已保存");
@@ -2143,7 +2292,7 @@ function MainApp() {
       const response = await invokeSearchWithRecents(query);
       setCustomCommands(commands);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       if (customCommandDraft.id === command.id) {
         setCustomCommandDraft({ name: "", commandType: "url", target: "" });
@@ -2169,7 +2318,7 @@ function MainApp() {
       const response = await invokeSearchWithRecents(query);
       setPhrases(loadedPhrases);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       setPhraseDraft({ title: "", text: "" });
       setActionMessage("快捷短语已保存");
@@ -2195,7 +2344,7 @@ function MainApp() {
       const response = await invokeSearchWithRecents(query);
       setPhrases(loadedPhrases);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       if (phraseDraft.id === phrase.id) {
         setPhraseDraft({ title: "", text: "" });
@@ -2227,7 +2376,7 @@ function MainApp() {
       const response = await invokeSearchWithRecents(query);
       setWebSearchTemplates(loadedWebSearchTemplates);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       setWebSearchTemplateDraft({
         keyword: "",
@@ -2260,7 +2409,7 @@ function MainApp() {
       const response = await invokeSearchWithRecents(query);
       setWebSearchTemplates(loadedWebSearchTemplates);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       if (webSearchTemplateDraft.id === template.id) {
         setWebSearchTemplateDraft({
@@ -2290,7 +2439,7 @@ function MainApp() {
       const response = await invokeSearchWithRecents(query);
       setExclusionRules(loadedExclusionRules);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       setExclusionRuleDraft({ matchType: "result_id", pattern: "" });
       setActionMessage("排除规则已保存");
@@ -2320,7 +2469,7 @@ function MainApp() {
       const response = await invokeSearchWithRecents(query);
       setExclusionRules(loadedExclusionRules);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       if (exclusionRuleDraft.id === rule.id) {
         setExclusionRuleDraft({ matchType: "result_id", pattern: "" });
@@ -2343,7 +2492,7 @@ function MainApp() {
       setActionMessage("搜索源设置已保存");
       const response = await invokeSearchWithRecents(query);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       clearError();
     } catch (error) {
@@ -2362,13 +2511,91 @@ function MainApp() {
       });
       const response = await invokeSearchWithRecents(query);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       setActionMessage("搜索权重已保存");
       clearError();
     } catch (error) {
       setSearchWeights(searchWeights);
       showError("配置", "搜索权重保存失败", error);
+    }
+  }
+
+  async function updateSmartRankingEnabled(value: boolean) {
+    const previousValue = smartRankingEnabled;
+    setSmartRankingEnabled(value);
+
+    try {
+      await invoke("set_setting", {
+        key: "search.smart_ranking.enabled",
+        value: value ? "true" : "false",
+      });
+      const response = await invokeSearchWithRecents(query);
+      if (response !== null) {
+        setSearchResults(response);
+      }
+      setActionMessage(value ? "智能排序已开启" : "智能排序已关闭");
+      clearError();
+    } catch (error) {
+      setSmartRankingEnabled(previousValue);
+      showError("配置", "智能排序设置保存失败", error);
+    }
+  }
+
+  async function clearRankingData(kind: "recent" | "query" | "all") {
+    const label =
+      kind === "recent" ? "最近使用记录" : kind === "query" ? "查询词学习记录" : "全部学习数据";
+    if (!window.confirm(`清空${label}？\n\n固定结果和 alias 会保留。`)) {
+      return;
+    }
+
+    const command =
+      kind === "recent"
+        ? "clear_recent_items"
+        : kind === "query"
+          ? "clear_query_selection_stats"
+          : "clear_ranking_learning";
+
+    try {
+      const cleared = await invoke<number>(command);
+      const response = await invokeSearchWithRecents(query);
+      if (response !== null) {
+        setSearchResults(response);
+      }
+      setActionMessage(`已清空${label}：${cleared} 条`);
+      clearError();
+    } catch (error) {
+      showError("配置", `${label}清空失败`, error);
+    }
+  }
+
+  async function refreshIconCacheStatus() {
+    try {
+      const status = await invoke<IconCacheStatus>("icon_cache_status");
+      setIconCacheStatus(status);
+      setActionMessage(`图标缓存：${status.fileCount} 个文件`);
+      clearError();
+    } catch (error) {
+      showError("配置", "图标缓存状态读取失败", error);
+    }
+  }
+
+  async function clearIconCache() {
+    if (!window.confirm("清空图标缓存？\n\n下次搜索会按需重新生成本地图标。")) {
+      return;
+    }
+
+    try {
+      const result = await invoke<IconCacheClearResult>("clear_icon_cache");
+      setIconCacheStatus(result.status);
+      resultIconPathsRef.current.clear();
+      setResults((current) =>
+        current.map((item) => (item.iconPath ? { ...item, iconPath: null } : item)),
+      );
+      setActionMessage(`已清空图标缓存：${result.clearedCount} 个文件`);
+      clearError();
+    } catch (error) {
+      showError("配置", "图标缓存清空失败", error);
     }
   }
 
@@ -2383,7 +2610,7 @@ function MainApp() {
       setPasswordOptions(savedOptions);
       const response = await invokeSearchWithRecents(query);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       setActionMessage("工具设置已保存");
       clearError();
@@ -2405,7 +2632,7 @@ function MainApp() {
       });
       const response = await invokeSearchWithRecents(query);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       setActionMessage(`工具总入口已保存：${nextAlias}`);
       clearError();
@@ -2428,7 +2655,7 @@ function MainApp() {
       });
       const response = await invokeSearchWithRecents(query);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       setActionMessage("Everything 搜索选项已保存");
       clearError();
@@ -2534,7 +2761,7 @@ function MainApp() {
       setActionMessage(`已进入：${result.title}`);
       const response = await invokeSearchWithRecents(nextQuery);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       clearError();
       return;
@@ -2554,7 +2781,7 @@ function MainApp() {
       setActionMessage(`${actionLabels[result.action]}：${result.title}`);
       const response = await invokeSearchWithRecents(query);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
       }
       clearError();
     } catch (error) {
@@ -2595,7 +2822,7 @@ function MainApp() {
       setContextSession(null);
       const response = await invokeSearchWithRecents(query);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
         setSelectedIndex(0);
       }
       setActionMessage(`已隐藏：${result.title}`);
@@ -2679,7 +2906,7 @@ function MainApp() {
       setContextSession(null);
       const response = await invokeSearchWithRecents(query);
       if (response !== null) {
-        setResults(response);
+        setSearchResults(response);
         setSelectedIndex(0);
       }
       setActionMessage(`已删除：${result.title}`);
@@ -2749,6 +2976,87 @@ function MainApp() {
     }
   }
 
+  async function setResultPinned(result: SearchResult, pinned: boolean) {
+    try {
+      await invoke<PinnedResult | null>("set_result_pinned", {
+        input: resultRankingInput(result),
+        pinned,
+      });
+      const loadedPinnedResults = await invoke<PinnedResult[]>("list_pinned_results");
+      setPinnedResults(loadedPinnedResults);
+      const response = await invokeSearchWithRecents(query);
+      if (response !== null) {
+        setSearchResults(response);
+        setSelectedIndex(0);
+      }
+      setActionMessage(`${pinned ? "已固定" : "已取消固定"}：${result.title}`);
+      clearError();
+    } catch (error) {
+      showError("配置", `${pinned ? "固定" : "取消固定"}失败：${result.title}`, error);
+    }
+  }
+
+  async function addResultAlias(result: SearchResult) {
+    const alias = window.prompt(`为此结果添加 alias：\n\n${result.title}`);
+    if (!alias?.trim()) {
+      setActionMessage(`已取消添加 alias：${result.title}`);
+      return;
+    }
+
+    try {
+      await invoke<ResultAlias>("save_result_alias", {
+        input: {
+          ...resultRankingInput(result),
+          alias: alias.trim(),
+        },
+      });
+      const loadedResultAliases = await invoke<ResultAlias[]>("list_result_aliases");
+      setResultAliases(loadedResultAliases);
+      const response = await invokeSearchWithRecents(query);
+      if (response !== null) {
+        setSearchResults(response);
+        setSelectedIndex(0);
+      }
+      setActionMessage(`Alias 已保存：${alias.trim()} -> ${result.title}`);
+      clearError();
+    } catch (error) {
+      showError("配置", `Alias 保存失败：${result.title}`, error);
+    }
+  }
+
+  async function deleteResultAliases(result: SearchResult) {
+    const aliases = resultAliases.filter((alias) => alias.resultId === result.id);
+    if (aliases.length === 0) {
+      setActionMessage(`没有可删除的 alias：${result.title}`);
+      return;
+    }
+
+    if (
+      !window.confirm(
+        `删除此结果的 alias？\n\n${aliases.map((alias) => alias.alias).join(", ")}\n\n${result.title}`,
+      )
+    ) {
+      return;
+    }
+
+    try {
+      for (const alias of aliases) {
+        await invoke("delete_result_alias", { normalizedAlias: alias.normalizedAlias });
+      }
+      const loadedResultAliases = await invoke<ResultAlias[]>("list_result_aliases");
+      setResultAliases(loadedResultAliases);
+      const response = await invokeSearchWithRecents(query);
+      if (response !== null) {
+        setSearchResults(response);
+        setSelectedIndex(0);
+      }
+      setActionMessage(`已删除 alias：${result.title}`);
+      clearError();
+    } catch (error) {
+      showError("配置", `Alias 删除失败：${result.title}`, error);
+    }
+  }
+
   async function copyResultValue(result: SearchResult, value: string, label: string) {
     try {
       await invoke("copy_path", { path: value });
@@ -2760,7 +3068,13 @@ function MainApp() {
   }
 
   function openResultContextMenu(result: SearchResult) {
-    const actions = contextActionsForResult(result, fileEditorPath, folderEditorPath);
+    const actions = contextActionsForResult(
+      result,
+      fileEditorPath,
+      folderEditorPath,
+      pinnedResults,
+      resultAliases,
+    );
     if (actions.length === 0) {
       setActionMessage(`没有可用操作：${result.title}`);
       return;
@@ -2783,6 +3097,18 @@ function MainApp() {
     switch (action.id) {
       case "execute":
         await executeSelectedResult(result);
+        return;
+      case "pinResult":
+        await setResultPinned(result, true);
+        return;
+      case "unpinResult":
+        await setResultPinned(result, false);
+        return;
+      case "addAlias":
+        await addResultAlias(result);
+        return;
+      case "deleteAlias":
+        await deleteResultAliases(result);
         return;
       case "openParent":
         await openResultParent(result);
@@ -3233,6 +3559,76 @@ function MainApp() {
                   </div>
                   <div className="settingsSubsection">
                     <div className="settingsHeader compact">
+                      <strong>智能排序</strong>
+                      <small>最近使用和查询词学习只保存在本机；固定结果和 alias 不受此开关影响</small>
+                    </div>
+                    <div className="sourceToggles" aria-label="智能排序操作">
+                      <ToggleButton
+                        active={smartRankingEnabled}
+                        label={`习惯学习${smartRankingEnabled ? "开" : "关"}`}
+                        onClick={() => updateSmartRankingEnabled(!smartRankingEnabled)}
+                      />
+                      <button
+                        className="sourceToggle"
+                        type="button"
+                        onClick={() => clearRankingData("recent")}
+                      >
+                        清空最近
+                      </button>
+                      <button
+                        className="sourceToggle"
+                        type="button"
+                        onClick={() => clearRankingData("query")}
+                      >
+                        清空学习
+                      </button>
+                      <button
+                        className="sourceToggle dangerToggle"
+                        type="button"
+                        onClick={() => clearRankingData("all")}
+                      >
+                        清空全部
+                      </button>
+                    </div>
+                    <small className="settingsHint">
+                      固定结果和 alias 通过搜索结果右键菜单管理，不会被清空学习数据删除。
+                    </small>
+                  </div>
+                  <div className="settingsSubsection">
+                    <div className="settingsHeader compact">
+                      <strong>结果图标缓存</strong>
+                      <small>
+                        {iconCacheStatus
+                          ? `${iconCacheStatus.fileCount} 个文件 · ${formatFileSize(iconCacheStatus.sizeBytes) ?? "0 B"}`
+                          : "尚未读取图标缓存"}
+                      </small>
+                    </div>
+                    <div className="settingRow iconCacheRow">
+                      <span className="settingLabel">目录</span>
+                      <span
+                        className={iconCacheStatus ? "pathPreview configured" : "pathPreview"}
+                        title={iconCacheStatus?.directory || undefined}
+                      >
+                        {iconCacheStatus?.directory || "本地图标缓存目录"}
+                      </span>
+                      <button type="button" onClick={refreshIconCacheStatus}>
+                        刷新
+                      </button>
+                      <button
+                        type="button"
+                        className="secondaryButton"
+                        disabled={!iconCacheStatus || iconCacheStatus.fileCount === 0}
+                        onClick={clearIconCache}
+                      >
+                        清空
+                      </button>
+                    </div>
+                    <small className="settingsHint">
+                      只保存本机 Shell 提取出的 32x32 PNG；搜索词、路径和文件信息不会上传。
+                    </small>
+                  </div>
+                  <div className="settingsSubsection">
+                    <div className="settingsHeader compact">
                       <strong>Everything 高级选项</strong>
                       <small>{everythingStatus?.message ?? "用于文件搜索的 Everything 查询参数"}</small>
                     </div>
@@ -3324,30 +3720,46 @@ function MainApp() {
                     </div>
                     <div className="settingRow configIoRow">
                       <span className="settingLabel">文件</span>
-                      <input
-                        aria-label="文件编辑器路径"
-                        value={fileEditorPath}
-                        onChange={(event) => setFileEditorPath(event.target.value)}
-                        placeholder="例如 C:\\Program Files\\Microsoft VS Code\\Code.exe"
-                      />
-                      <button type="button" onClick={saveEditorPaths}>
-                        保存
+                      <span
+                        className={fileEditorPath ? "pathPreview configured" : "pathPreview"}
+                        title={fileEditorPath || undefined}
+                      >
+                        {fileEditorPath || "未配置文件编辑器"}
+                      </span>
+                      <button type="button" onClick={() => chooseEditorPath("file")}>
+                        选择
+                      </button>
+                      <button
+                        type="button"
+                        className="secondaryButton"
+                        disabled={!fileEditorPath}
+                        onClick={() => clearEditorPath("file")}
+                      >
+                        清除
                       </button>
                     </div>
                     <div className="settingRow configIoRow">
                       <span className="settingLabel">目录</span>
-                      <input
-                        aria-label="目录编辑器路径"
-                        value={folderEditorPath}
-                        onChange={(event) => setFolderEditorPath(event.target.value)}
-                        placeholder="例如 C:\\Program Files\\Microsoft VS Code\\Code.exe"
-                      />
-                      <button type="button" onClick={saveEditorPaths}>
-                        保存
+                      <span
+                        className={folderEditorPath ? "pathPreview configured" : "pathPreview"}
+                        title={folderEditorPath || undefined}
+                      >
+                        {folderEditorPath || "未配置目录编辑器"}
+                      </span>
+                      <button type="button" onClick={() => chooseEditorPath("folder")}>
+                        选择
+                      </button>
+                      <button
+                        type="button"
+                        className="secondaryButton"
+                        disabled={!folderEditorPath}
+                        onClick={() => clearEditorPath("folder")}
+                      >
+                        清除
                       </button>
                     </div>
                     <small className="settingsHint">
-                      留空则隐藏对应菜单项；启动时会把当前文件或目录路径作为参数传给编辑器。
+                      选择编辑器可执行文件；清除后隐藏对应菜单项。启动时会把当前文件或目录路径作为参数传给编辑器。
                     </small>
                   </div>
                 </>
@@ -4652,6 +5064,8 @@ function MainApp() {
                   .filter(Boolean)
                   .join(" ")}
                 icon={resultIcon(result)}
+                iconPath={result.iconPath}
+                iconRetryKey={resultsRevision}
                 key={result.id}
                 onClick={async () => {
                   setSelectedIndex(index);
@@ -5460,6 +5874,8 @@ function ResultRow({
   children,
   className = "",
   icon,
+  iconPath,
+  iconRetryKey,
   onClick,
   onContextMenu,
   onKeyDown,
@@ -5471,6 +5887,8 @@ function ResultRow({
   children: ReactNode;
   className?: string;
   icon: string;
+  iconPath?: string | null;
+  iconRetryKey: number;
   onClick: () => void | Promise<void>;
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
   onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
@@ -5478,6 +5896,49 @@ function ResultRow({
   role?: string;
   selected: boolean;
 }) {
+  const iconSrc = useMemo(() => fileSrcForIconPath(iconPath), [iconPath]);
+  const [imageRetry, setImageRetry] = useState(0);
+  const [loadedIconSrc, setLoadedIconSrc] = useState<string | null>(null);
+  const [failedIconSrc, setFailedIconSrc] = useState<string | null>(null);
+  const imageFailedRef = useRef(false);
+  const attemptedIconSrc = useMemo(
+    () => appendIconRetryParam(iconSrc, imageRetry),
+    [iconSrc, imageRetry],
+  );
+  const imageFailed = Boolean(attemptedIconSrc && failedIconSrc === attemptedIconSrc);
+  const imageLoaded = Boolean(attemptedIconSrc && loadedIconSrc === attemptedIconSrc);
+
+  useEffect(() => {
+    imageFailedRef.current = false;
+    setImageRetry(0);
+  }, [iconSrc]);
+
+  useEffect(() => {
+    if (!imageFailedRef.current) {
+      return;
+    }
+
+    imageFailedRef.current = false;
+    setImageRetry(0);
+    setFailedIconSrc(null);
+  }, [iconRetryKey]);
+
+  useEffect(() => {
+    if (!iconSrc || !imageFailed || imageRetry >= 2) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setImageRetry((current) => current + 1);
+    }, 250 * (imageRetry + 1));
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [iconSrc, imageFailed, imageRetry]);
+
+  const showImageIcon = Boolean(attemptedIconSrc && imageLoaded && !imageFailed);
+
   return (
     <div
       aria-selected={selected}
@@ -5489,7 +5950,37 @@ function ResultRow({
       role={role}
       tabIndex={0}
     >
-      <span className="resultIcon">{icon}</span>
+      <span className={showImageIcon ? "resultIcon imageResultIcon" : "resultIcon"}>
+        {attemptedIconSrc && !imageFailed ? (
+          <img
+            alt=""
+            aria-hidden="true"
+            className={showImageIcon ? "resultIconImage" : "resultIconImage loadingResultIconImage"}
+            draggable={false}
+            onLoad={() => {
+              imageFailedRef.current = false;
+              setLoadedIconSrc(attemptedIconSrc);
+              setFailedIconSrc(null);
+            }}
+            onError={() => {
+              if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) {
+                console.debug("[icons] failed to load result icon", {
+                  iconPath,
+                  iconSrc: attemptedIconSrc,
+                  retry: imageRetry,
+                });
+              }
+              imageFailedRef.current = true;
+              setLoadedIconSrc(null);
+              setFailedIconSrc(attemptedIconSrc);
+            }}
+            src={attemptedIconSrc}
+          />
+        ) : null}
+        {showImageIcon ? null : (
+          icon
+        )}
+      </span>
       <span className="resultText">{children}</span>
       <span className="resultActions">{actions}</span>
     </div>
@@ -5654,6 +6145,133 @@ function fallbackResults(query: string): SearchResult[] {
   );
 }
 
+function mergeIconUpdates(results: SearchResult[], updates: SearchIconUpdate[]): SearchResult[] {
+  if (updates.length === 0) {
+    return results;
+  }
+
+  const iconPaths = new Map(updates.map((update) => [update.resultId, update.iconPath]));
+  let changed = false;
+  const nextResults = results.map((result) => {
+    const iconPath = iconPaths.get(result.id);
+    if (!iconPath || result.iconPath === iconPath) {
+      return result;
+    }
+    changed = true;
+    return { ...result, iconPath };
+  });
+
+  return changed ? nextResults : results;
+}
+
+function mergeResultsPreservingIcons(
+  nextResults: SearchResult[],
+  currentResults: SearchResult[],
+  cachedIconPaths?: Map<string, string>,
+): SearchResult[] {
+  if (nextResults.length === 0) {
+    return nextResults;
+  }
+
+  const currentIconPaths = new Map<string, string>();
+  if (cachedIconPaths) {
+    for (const [key, iconPath] of cachedIconPaths) {
+      currentIconPaths.set(key, iconPath);
+    }
+  }
+  cacheResultIcons(currentResults, currentIconPaths);
+
+  if (currentIconPaths.size === 0) {
+    return nextResults;
+  }
+
+  let changed = false;
+  const mergedResults = nextResults.map((result) => {
+    if (result.iconPath) {
+      return result;
+    }
+
+    const iconPath = cachedIconPathForResult(result, currentIconPaths);
+    if (!iconPath) {
+      return result;
+    }
+
+    changed = true;
+    return { ...result, iconPath };
+  });
+
+  return changed ? mergedResults : nextResults;
+}
+
+function cacheResultIcons(results: SearchResult[], iconPaths: Map<string, string>) {
+  for (const result of results) {
+    if (result.iconPath) {
+      for (const key of resultIconCacheKeys(result)) {
+        iconPaths.set(key, result.iconPath);
+      }
+    }
+  }
+}
+
+function cachedIconPathForResult(result: SearchResult, iconPaths: Map<string, string>) {
+  for (const key of resultIconCacheKeys(result)) {
+    const iconPath = iconPaths.get(key);
+    if (!iconPath) {
+      continue;
+    }
+    return iconPath;
+  }
+
+  return null;
+}
+
+function resultIconCacheKeys(result: SearchResult): string[] {
+  const keys = [`id:${result.id}`];
+  const path = normalizeResultIconPath(result.fileMetadata?.fullPath ?? result.subtitle);
+  if (path && (result.kind === "file" || result.kind === "app")) {
+    keys.push(`path:${path}`);
+  }
+
+  return keys;
+}
+
+function normalizeResultIconPath(path: string): string {
+  let normalized = path.trim().replace(/\//g, "\\").toLowerCase();
+  while (normalized.length > 3 && normalized.endsWith("\\")) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+function fileSrcForIconPath(iconPath?: string | null): string | null {
+  if (!iconPath) {
+    return null;
+  }
+
+  const tauriWindow = window as Window & { __TAURI_INTERNALS__?: unknown };
+  if (!tauriWindow.__TAURI_INTERNALS__) {
+    return null;
+  }
+
+  try {
+    return convertFileSrc(iconPath);
+  } catch {
+    return null;
+  }
+}
+
+function appendIconRetryParam(iconSrc: string | null, retry: number): string | undefined {
+  if (!iconSrc) {
+    return undefined;
+  }
+  if (retry <= 0) {
+    return iconSrc;
+  }
+
+  const separator = iconSrc.includes("?") ? "&" : "?";
+  return `${iconSrc}${separator}retry=${retry}`;
+}
+
 function providerToDraft(provider: AiProvider): AiProviderDraft {
   return {
     id: provider.id,
@@ -5793,6 +6411,8 @@ function contextActionsForResult(
   result: SearchResult,
   fileEditorPath = "",
   folderEditorPath = "",
+  pinnedResults: PinnedResult[] = [],
+  resultAliases: ResultAlias[] = [],
 ): ResultContextAction[] {
   const actions: ResultContextAction[] = [
     {
@@ -5801,6 +6421,28 @@ function contextActionsForResult(
       subtitle: result.title,
     },
   ];
+
+  if (matchesRankableResult(result)) {
+    const pinned = pinnedResults.some((item) => item.resultId === result.id);
+    actions.push({
+      id: pinned ? "unpinResult" : "pinResult",
+      title: pinned ? "取消固定" : "固定到顶部",
+      subtitle: pinned ? "恢复为普通排序" : "匹配搜索时优先显示",
+    });
+    actions.push({
+      id: "addAlias",
+      title: "添加 alias",
+      subtitle: "输入短词快速命中此结果",
+    });
+    const aliases = resultAliases.filter((alias) => alias.resultId === result.id);
+    if (aliases.length > 0) {
+      actions.push({
+        id: "deleteAlias",
+        title: "删除 alias",
+        subtitle: aliases.map((alias) => alias.alias).join(", "),
+      });
+    }
+  }
 
   if (matchesPathBackedResult(result)) {
     actions.push(
@@ -5950,6 +6592,19 @@ function matchesExcludableResult(result: SearchResult): boolean {
   return result.kind === "app" || result.kind === "file";
 }
 
+function matchesRankableResult(result: SearchResult): boolean {
+  return !result.id.startsWith("internal:") && ["app", "file", "command", "webSearch"].includes(result.kind);
+}
+
+function resultRankingInput(result: SearchResult) {
+  return {
+    resultId: result.id,
+    kind: result.kind,
+    title: result.title,
+    target: result.subtitle,
+  };
+}
+
 function isDirectoryResult(result: SearchResult): boolean {
   return result.fileMetadata?.isDir === true || result.source.includes("目录");
 }
@@ -5993,7 +6648,32 @@ function resultIcon(result: SearchResult): string {
     return "CMD";
   }
 
+  if (result.kind === "webSearch") {
+    return webSearchIcon(result);
+  }
+
   return kindMarks[result.kind];
+}
+
+function webSearchIcon(result: SearchResult): string {
+  const text = `${result.title} ${result.subtitle}`.toLowerCase();
+  if (text.includes("github.com") || text.includes("github")) {
+    return "GH";
+  }
+  if (text.includes("bing.com") || text.includes("bing") || text.includes("必应")) {
+    return "BING";
+  }
+  if (text.includes("google.com") || text.includes("google")) {
+    return "GO";
+  }
+  if (text.includes("stackoverflow.com") || text.includes("stack overflow")) {
+    return "SO";
+  }
+  if (text.includes("developer.mozilla.org") || text.includes("mdn")) {
+    return "MDN";
+  }
+
+  return "WEB";
 }
 
 

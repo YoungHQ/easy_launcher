@@ -139,6 +139,49 @@ pub struct ExclusionRuleInput {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PinnedResult {
+    pub result_id: String,
+    pub kind: String,
+    pub title: String,
+    pub target: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedResultInput {
+    pub result_id: String,
+    pub kind: String,
+    pub title: String,
+    pub target: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultAlias {
+    pub alias: String,
+    pub normalized_alias: String,
+    pub result_id: String,
+    pub kind: String,
+    pub title: String,
+    pub target: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultAliasInput {
+    pub alias: String,
+    pub result_id: String,
+    pub kind: String,
+    pub title: String,
+    pub target: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AiModelProfile {
     pub id: String,
     pub provider_type: String,
@@ -484,6 +527,209 @@ impl Storage {
         }
 
         Ok(scores)
+    }
+
+    pub fn clear_recent_items(&self) -> Result<usize, StorageError> {
+        self.connection
+            .execute("DELETE FROM recent_items", [])
+            .map_err(StorageError::from)
+    }
+
+    pub fn clear_query_selection_stats(&self) -> Result<usize, StorageError> {
+        self.connection
+            .execute("DELETE FROM query_selection_stats", [])
+            .map_err(StorageError::from)
+    }
+
+    pub fn clear_ranking_learning(&self) -> Result<usize, StorageError> {
+        let recent_count = self.clear_recent_items()?;
+        let query_count = self.clear_query_selection_stats()?;
+        Ok(recent_count + query_count)
+    }
+
+    pub fn list_pinned_results(&self) -> Result<Vec<PinnedResult>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT result_id, kind, title, target, created_at, updated_at
+             FROM pinned_results
+             ORDER BY updated_at DESC, title COLLATE NOCASE ASC",
+        )?;
+        let rows = statement.query_map([], pinned_result_from_row)?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn pinned_result_scores(&self) -> Result<HashMap<String, f32>, StorageError> {
+        let mut scores = HashMap::new();
+        for result in self.list_pinned_results()? {
+            scores.insert(result.result_id, 0.65);
+        }
+        Ok(scores)
+    }
+
+    pub fn set_result_pinned(
+        &self,
+        input: PinnedResultInput,
+        pinned: bool,
+    ) -> Result<Option<PinnedResult>, StorageError> {
+        let result_id = input.result_id.trim();
+        if result_id.is_empty() {
+            return Err(StorageError::Validation("结果 ID 不能为空".into()));
+        }
+
+        if !pinned {
+            self.delete_pinned_result(result_id)?;
+            return Ok(None);
+        }
+
+        let kind = input.kind.trim();
+        let title = input.title.trim();
+        let target = input.target.trim();
+        if kind.is_empty() || title.is_empty() {
+            return Err(StorageError::Validation("固定结果缺少类型或标题".into()));
+        }
+
+        self.connection.execute(
+            "INSERT INTO pinned_results (result_id, kind, title, target, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(result_id) DO UPDATE SET
+                kind = excluded.kind,
+                title = excluded.title,
+                target = excluded.target,
+                updated_at = excluded.updated_at",
+            params![result_id, kind, title, target],
+        )?;
+
+        self.get_pinned_result(result_id)
+    }
+
+    pub fn delete_pinned_result(&self, result_id: &str) -> Result<bool, StorageError> {
+        let affected = self.connection.execute(
+            "DELETE FROM pinned_results WHERE result_id = ?1",
+            params![result_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn get_pinned_result(&self, result_id: &str) -> Result<Option<PinnedResult>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT result_id, kind, title, target, created_at, updated_at
+                 FROM pinned_results
+                 WHERE result_id = ?1",
+                params![result_id],
+                pinned_result_from_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    pub fn list_result_aliases(&self) -> Result<Vec<ResultAlias>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT alias, normalized_alias, result_id, kind, title, target, created_at, updated_at
+             FROM result_aliases
+             ORDER BY alias COLLATE NOCASE ASC",
+        )?;
+        let rows = statement.query_map([], result_alias_from_row)?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn upsert_result_alias(
+        &self,
+        input: ResultAliasInput,
+    ) -> Result<ResultAlias, StorageError> {
+        let alias = input.alias.trim();
+        let normalized_alias = normalize_result_alias(alias)?;
+        let result_id = input.result_id.trim();
+        let kind = input.kind.trim();
+        let title = input.title.trim();
+        let target = input.target.trim();
+        if result_id.is_empty() || kind.is_empty() || title.is_empty() {
+            return Err(StorageError::Validation("Alias 目标结果不完整".into()));
+        }
+
+        let tool_menu_alias_conflict = self
+            .get_setting("tools.menu.alias")?
+            .map(|value| value.trim().eq_ignore_ascii_case(&normalized_alias))
+            .unwrap_or(false);
+        if tool_menu_alias_conflict {
+            return Err(StorageError::Validation("Alias 与工具总入口冲突".into()));
+        }
+
+        let web_keyword_conflict = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM web_search_templates WHERE lower(keyword) = lower(?1)",
+                params![normalized_alias],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if web_keyword_conflict {
+            return Err(StorageError::Validation(
+                "Alias 与网页搜索关键词冲突".into(),
+            ));
+        }
+
+        let existing_result_id = self
+            .connection
+            .query_row(
+                "SELECT result_id FROM result_aliases WHERE normalized_alias = ?1",
+                params![normalized_alias],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing_result_id
+            .as_deref()
+            .is_some_and(|existing| existing != result_id)
+        {
+            return Err(StorageError::Validation("Alias 已被其他结果使用".into()));
+        }
+
+        self.connection.execute(
+            "INSERT INTO result_aliases (
+                alias, normalized_alias, result_id, kind, title, target, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(normalized_alias) DO UPDATE SET
+                alias = excluded.alias,
+                result_id = excluded.result_id,
+                kind = excluded.kind,
+                title = excluded.title,
+                target = excluded.target,
+                updated_at = excluded.updated_at",
+            params![alias, normalized_alias, result_id, kind, title, target],
+        )?;
+
+        self.get_result_alias(&normalized_alias)?
+            .ok_or_else(|| StorageError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn delete_result_alias(&self, normalized_alias: &str) -> Result<bool, StorageError> {
+        let normalized_alias = normalize_result_alias(normalized_alias)?;
+        let affected = self.connection.execute(
+            "DELETE FROM result_aliases WHERE normalized_alias = ?1",
+            params![normalized_alias],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn get_result_alias(
+        &self,
+        normalized_alias: &str,
+    ) -> Result<Option<ResultAlias>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT alias, normalized_alias, result_id, kind, title, target, created_at, updated_at
+                 FROM result_aliases
+                 WHERE normalized_alias = ?1",
+                params![normalized_alias],
+                result_alias_from_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
     }
 
     pub fn list_custom_commands(&self) -> Result<Vec<CustomCommand>, StorageError> {
@@ -1631,6 +1877,26 @@ fn initialize_schema(connection: &Connection) -> Result<(), StorageError> {
             PRIMARY KEY(normalized_query, result_id)
         );
 
+        CREATE TABLE IF NOT EXISTS pinned_results (
+            result_id TEXT PRIMARY KEY NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            target TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS result_aliases (
+            normalized_alias TEXT PRIMARY KEY NOT NULL,
+            alias TEXT NOT NULL,
+            result_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            target TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+
         CREATE TABLE IF NOT EXISTS custom_commands (
             id TEXT PRIMARY KEY NOT NULL,
             name TEXT NOT NULL UNIQUE,
@@ -1888,6 +2154,30 @@ fn exclusion_rule_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exclusio
         pattern: row.get(2)?,
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
+    })
+}
+
+fn pinned_result_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PinnedResult> {
+    Ok(PinnedResult {
+        result_id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        target: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn result_alias_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResultAlias> {
+    Ok(ResultAlias {
+        alias: row.get(0)?,
+        normalized_alias: row.get(1)?,
+        result_id: row.get(2)?,
+        kind: row.get(3)?,
+        title: row.get(4)?,
+        target: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -2264,6 +2554,58 @@ fn recent_score_decay(age_days: f64) -> f32 {
     }
 }
 
+fn normalize_result_alias(alias: &str) -> Result<String, StorageError> {
+    let normalized = alias
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if normalized.is_empty() {
+        return Err(StorageError::Validation("Alias 不能为空".into()));
+    }
+    if normalized.len() > 64 {
+        return Err(StorageError::Validation("Alias 不能超过 64 个字符".into()));
+    }
+    if normalized
+        .chars()
+        .any(|character| character == '\n' || character == '\r')
+    {
+        return Err(StorageError::Validation("Alias 不能包含换行".into()));
+    }
+    if matches!(
+        normalized.as_str(),
+        "app"
+            | "apps"
+            | "a"
+            | "file"
+            | "files"
+            | "f"
+            | "cmd"
+            | "command"
+            | "commands"
+            | "sys"
+            | "system"
+            | "calc"
+            | "calculator"
+            | "phrase"
+            | "phrases"
+            | "snippet"
+            | "snippets"
+            | "ai"
+            | "gpt"
+            | "web"
+            | "www"
+            | "enc"
+            | "dec"
+            | "pwd"
+            | "time"
+            | "tools"
+    ) {
+        return Err(StorageError::Validation("Alias 与内置关键词冲突".into()));
+    }
+    Ok(normalized)
+}
+
 fn seed_defaults(connection: &Connection) -> Result<(), StorageError> {
     let defaults = [
         ("launcher.shortcut", "Alt+1"),
@@ -2291,6 +2633,7 @@ fn seed_defaults(connection: &Connection) -> Result<(), StorageError> {
         ("search.weight.web_search", "1.00"),
         ("search.source.tools", "true"),
         ("search.weight.tools", "1.00"),
+        ("search.smart_ranking.enabled", "true"),
         ("everything.search.full_path", "false"),
         ("everything.search.content", "false"),
         ("tools.menu.alias", "/"),
@@ -2942,6 +3285,165 @@ mod tests {
             .query_selection_scores("missing")
             .expect("read missing query scores")
             .is_empty());
+    }
+
+    #[test]
+    fn clears_ranking_learning_without_removing_manual_rules() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage::from_connection_for_tests(connection);
+
+        storage
+            .record_recent_item("app:vscode", "app", "Code", r"C:\Code.exe")
+            .expect("record recent item");
+        storage
+            .record_query_selection("code", "app:vscode")
+            .expect("record query selection");
+        storage
+            .set_result_pinned(
+                PinnedResultInput {
+                    result_id: "app:vscode".into(),
+                    kind: "app".into(),
+                    title: "Code".into(),
+                    target: r"C:\Code.exe".into(),
+                },
+                true,
+            )
+            .expect("pin result");
+        storage
+            .upsert_result_alias(ResultAliasInput {
+                alias: "ide".into(),
+                result_id: "app:vscode".into(),
+                kind: "app".into(),
+                title: "Code".into(),
+                target: r"C:\Code.exe".into(),
+            })
+            .expect("save alias");
+
+        let cleared = storage
+            .clear_ranking_learning()
+            .expect("clear ranking learning");
+
+        assert_eq!(cleared, 2);
+        assert!(storage.recent_scores().expect("recent scores").is_empty());
+        assert!(storage
+            .query_selection_scores("code")
+            .expect("query selection scores")
+            .is_empty());
+        assert_eq!(storage.list_pinned_results().expect("pinned").len(), 1);
+        assert_eq!(storage.list_result_aliases().expect("aliases").len(), 1);
+    }
+
+    #[test]
+    fn pinned_results_and_aliases_roundtrip() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage::from_connection_for_tests(connection);
+
+        let pinned = storage
+            .set_result_pinned(
+                PinnedResultInput {
+                    result_id: "app:vscode".into(),
+                    kind: "app".into(),
+                    title: "Code".into(),
+                    target: r"C:\Code.exe".into(),
+                },
+                true,
+            )
+            .expect("pin result")
+            .expect("pinned result");
+        assert_eq!(pinned.result_id, "app:vscode");
+        assert_eq!(
+            storage
+                .pinned_result_scores()
+                .expect("pinned scores")
+                .get("app:vscode")
+                .copied(),
+            Some(0.65)
+        );
+
+        let alias = storage
+            .upsert_result_alias(ResultAliasInput {
+                alias: "IDE".into(),
+                result_id: "app:vscode".into(),
+                kind: "app".into(),
+                title: "Code".into(),
+                target: r"C:\Code.exe".into(),
+            })
+            .expect("save alias");
+        assert_eq!(alias.normalized_alias, "ide");
+
+        assert!(storage.delete_result_alias("ide").expect("delete alias"));
+        assert!(storage
+            .set_result_pinned(
+                PinnedResultInput {
+                    result_id: "app:vscode".into(),
+                    kind: "app".into(),
+                    title: "Code".into(),
+                    target: r"C:\Code.exe".into(),
+                },
+                false,
+            )
+            .expect("unpin result")
+            .is_none());
+    }
+
+    #[test]
+    fn result_aliases_reject_conflicts() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        seed_defaults(&connection).expect("seed defaults");
+        let storage = Storage::from_connection_for_tests(connection);
+
+        assert!(storage
+            .upsert_result_alias(ResultAliasInput {
+                alias: "app".into(),
+                result_id: "app:vscode".into(),
+                kind: "app".into(),
+                title: "Code".into(),
+                target: r"C:\Code.exe".into(),
+            })
+            .is_err());
+        assert!(storage
+            .upsert_result_alias(ResultAliasInput {
+                alias: "web".into(),
+                result_id: "app:vscode".into(),
+                kind: "app".into(),
+                title: "Code".into(),
+                target: r"C:\Code.exe".into(),
+            })
+            .is_err());
+        storage
+            .set_setting("tools.menu.alias", "go")
+            .expect("set tool menu alias");
+        assert!(storage
+            .upsert_result_alias(ResultAliasInput {
+                alias: "go".into(),
+                result_id: "app:vscode".into(),
+                kind: "app".into(),
+                title: "Code".into(),
+                target: r"C:\Code.exe".into(),
+            })
+            .is_err());
+
+        storage
+            .upsert_result_alias(ResultAliasInput {
+                alias: "ide".into(),
+                result_id: "app:vscode".into(),
+                kind: "app".into(),
+                title: "Code".into(),
+                target: r"C:\Code.exe".into(),
+            })
+            .expect("save alias");
+        assert!(storage
+            .upsert_result_alias(ResultAliasInput {
+                alias: "ide".into(),
+                result_id: "app:other".into(),
+                kind: "app".into(),
+                title: "Other".into(),
+                target: r"C:\Other.exe".into(),
+            })
+            .is_err());
     }
 
     #[test]

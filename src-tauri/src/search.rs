@@ -4,7 +4,7 @@ use crate::everything::{
 };
 use crate::file_metadata::{read_file_metadata, FileMetadata};
 use crate::pinyin_search::{pinyin_match_score, pinyin_matches};
-use crate::storage::{CustomCommand, ExclusionRule, Phrase, WebSearchTemplate};
+use crate::storage::{CustomCommand, ExclusionRule, Phrase, ResultAlias, WebSearchTemplate};
 use crate::tools::{tool_results, PasswordOptions, ToolAction};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -35,6 +35,7 @@ pub struct SearchResult {
     pub score: f32,
     pub shortcut: Option<String>,
     pub file_metadata: Option<FileMetadata>,
+    pub icon_path: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -116,6 +117,8 @@ impl Default for EverythingSearchOptions {
 pub struct SearchContext<'a> {
     pub recent_scores: Option<&'a HashMap<String, f32>>,
     pub query_selection_scores: Option<&'a HashMap<String, f32>>,
+    pub pinned_scores: Option<&'a HashMap<String, f32>>,
+    pub result_aliases: Option<&'a [ResultAlias]>,
     pub custom_commands: Option<&'a [CustomCommand]>,
     pub phrases: Option<&'a [Phrase]>,
     pub web_search_templates: Option<&'a [WebSearchTemplate]>,
@@ -332,6 +335,8 @@ impl SearchCore {
             }
         }
 
+        results.extend(alias_results(&normalized_query, context));
+
         let dedupe_started_at = Instant::now();
         let mut results = if cancelled {
             Vec::new()
@@ -356,6 +361,8 @@ impl SearchCore {
         for result in &mut results {
             let match_score = match_score(&normalized_query, &result.title, &result.subtitle);
             result.score += match_score;
+            result.score += alias_boost(&normalized_query, context, result);
+            result.score += pinned_score(context, result);
             result.score += query_selection_score(context, result);
             result.score *= source_weight(context, result);
         }
@@ -429,6 +436,14 @@ impl SearchResultCache {
 
         while self.entries.len() > self.max_entries {
             self.entries.pop_back();
+        }
+    }
+
+    pub fn clear_icon_paths(&mut self) {
+        for entry in &mut self.entries {
+            for result in &mut entry.value.results {
+                result.icon_path = None;
+            }
         }
     }
 
@@ -709,6 +724,7 @@ impl SearchProvider for AppProvider {
                     source: app.source,
                     shortcut: Some("Enter".into()),
                     file_metadata: None,
+                    icon_path: None,
                 }
             })
             .collect()
@@ -789,6 +805,7 @@ impl SearchProvider for ToolProvider {
                     score: 0.96,
                     shortcut: Some("Enter".into()),
                     file_metadata: None,
+                    icon_path: None,
                 }
             })
             .collect()
@@ -824,6 +841,7 @@ impl SearchProvider for PhraseProvider {
                 score: 0.57 + (phrase.use_count.min(10) as f32 * 0.01),
                 shortcut: Some("Enter".into()),
                 file_metadata: None,
+                icon_path: None,
             })
             .collect()
     }
@@ -898,6 +916,7 @@ fn web_search_result(template: &WebSearchTemplate, query: &str, score: f32) -> S
         score,
         shortcut: Some("Enter".into()),
         file_metadata: None,
+        icon_path: None,
     }
 }
 
@@ -1267,6 +1286,7 @@ fn everything_unavailable_result_from_status(status: EverythingStatus) -> Option
         score: 0.62,
         shortcut: Some("Enter".into()),
         file_metadata: None,
+        icon_path: None,
     })
 }
 
@@ -1421,6 +1441,7 @@ fn path_result_with_title(title: String, path: PathBuf, source: &str, score: f32
         score,
         shortcut: Some("Enter".into()),
         file_metadata: Some(metadata),
+        icon_path: None,
     }
 }
 
@@ -1544,6 +1565,7 @@ fn everything_results(
                 score,
                 shortcut: Some("Enter".into()),
                 file_metadata: None,
+                icon_path: None,
             }
         })
         .collect()
@@ -1785,6 +1807,40 @@ fn query_selection_score(context: &SearchContext<'_>, result: &SearchResult) -> 
         .unwrap_or(0.0)
 }
 
+fn pinned_score(context: &SearchContext<'_>, result: &SearchResult) -> f32 {
+    context
+        .pinned_scores
+        .and_then(|scores| scores.get(&result.id))
+        .copied()
+        .unwrap_or(0.0)
+}
+
+fn alias_boost(query: &str, context: &SearchContext<'_>, result: &SearchResult) -> f32 {
+    let Some(aliases) = context.result_aliases else {
+        return 0.0;
+    };
+    let query = normalize_query(query);
+    if query.is_empty() {
+        return 0.0;
+    }
+
+    aliases
+        .iter()
+        .filter(|alias| alias.result_id == result.id)
+        .map(|alias| alias_match_boost(&query, &alias.normalized_alias))
+        .fold(0.0, f32::max)
+}
+
+fn alias_match_boost(query: &str, alias: &str) -> f32 {
+    if alias == query {
+        0.95
+    } else if alias.starts_with(query) {
+        0.45
+    } else {
+        0.0
+    }
+}
+
 fn result_source(result: &SearchResult) -> SearchSource {
     if result.id.starts_with("phrase:") {
         return SearchSource::Phrase;
@@ -1799,6 +1855,72 @@ fn result_source(result: &SearchResult) -> SearchSource {
         ResultKind::WebSearch => SearchSource::WebSearch,
         ResultKind::Tool => SearchSource::Tools,
     }
+}
+
+fn alias_results(query: &str, context: &SearchContext<'_>) -> Vec<SearchResult> {
+    let Some(aliases) = context.result_aliases else {
+        return Vec::new();
+    };
+    let query = normalize_query(query);
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    aliases
+        .iter()
+        .filter(|alias| alias_match_boost(&query, &alias.normalized_alias) > 0.0)
+        .filter_map(alias_result)
+        .filter(|result| context.enabled_sources.contains(&result_source(result)))
+        .collect()
+}
+
+fn alias_result(alias: &ResultAlias) -> Option<SearchResult> {
+    let kind = result_kind_from_storage_kind(&alias.kind)?;
+    let action = default_action_for_alias(alias, &kind);
+    Some(SearchResult {
+        id: alias.result_id.clone(),
+        title: alias.title.clone(),
+        subtitle: alias.target.clone(),
+        kind,
+        action,
+        source: format!("Alias · {}", alias.alias),
+        score: 0.62,
+        shortcut: Some("Enter".into()),
+        file_metadata: None,
+        icon_path: None,
+    })
+}
+
+fn result_kind_from_storage_kind(kind: &str) -> Option<ResultKind> {
+    match kind {
+        "app" => Some(ResultKind::App),
+        "file" => Some(ResultKind::File),
+        "command" => Some(ResultKind::Command),
+        "calculator" => Some(ResultKind::Calculator),
+        "aiAction" | "ai-action" => Some(ResultKind::AiAction),
+        "webSearch" | "web-search" => Some(ResultKind::WebSearch),
+        "tool" => Some(ResultKind::Tool),
+        _ => None,
+    }
+}
+
+fn default_action_for_kind(kind: ResultKind) -> ActionKind {
+    match kind {
+        ResultKind::App => ActionKind::LaunchApp,
+        ResultKind::File => ActionKind::OpenFile,
+        ResultKind::Command => ActionKind::RunCommand,
+        ResultKind::Calculator | ResultKind::Tool => ActionKind::CopyText,
+        ResultKind::AiAction => ActionKind::AiTranslate,
+        ResultKind::WebSearch => ActionKind::OpenUrl,
+    }
+}
+
+fn default_action_for_alias(alias: &ResultAlias, kind: &ResultKind) -> ActionKind {
+    if alias.result_id.starts_with("phrase:") {
+        return ActionKind::CopyText;
+    }
+
+    default_action_for_kind(kind.clone())
 }
 
 fn filter_excluded_results(results: &mut Vec<SearchResult>, rules: Option<&[ExclusionRule]>) {
@@ -2134,6 +2256,7 @@ fn system_command(id: &str, title: &str, command: &str, score: f32) -> SearchRes
         score,
         shortcut: Some("Enter".into()),
         file_metadata: None,
+        icon_path: None,
     }
 }
 
@@ -2160,6 +2283,7 @@ fn custom_command_results(
                 score: 0.56 + recent_score,
                 shortcut: Some("Enter".into()),
                 file_metadata: None,
+                icon_path: None,
             }
         })
         .collect()
@@ -2180,6 +2304,7 @@ fn calculator_result(query: &str) -> Option<SearchResult> {
         score: 0.92,
         shortcut: Some("Enter".into()),
         file_metadata: None,
+        icon_path: None,
     })
 }
 
@@ -2365,6 +2490,7 @@ mod tests {
             score: 0.1,
             shortcut: None,
             file_metadata: None,
+            icon_path: None,
         };
 
         let deduped = dedupe_results(vec![
@@ -2399,6 +2525,7 @@ mod tests {
                         score: 0.5,
                         shortcut: None,
                         file_metadata: None,
+                        icon_path: None,
                     },
                     SearchResult {
                         id: "file:notes".into(),
@@ -2410,6 +2537,7 @@ mod tests {
                         score: 0.4,
                         shortcut: None,
                         file_metadata: None,
+                        icon_path: None,
                     },
                     SearchResult {
                         id: "command-settings".into(),
@@ -2421,6 +2549,7 @@ mod tests {
                         score: 0.3,
                         shortcut: None,
                         file_metadata: None,
+                        icon_path: None,
                     },
                 ]
             }
@@ -2447,6 +2576,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -2475,6 +2606,7 @@ mod tests {
             score: 0.4,
             shortcut: None,
             file_metadata: None,
+            icon_path: None,
         };
         let rules = vec![ExclusionRule {
             id: "rule:path".into(),
@@ -2943,6 +3075,7 @@ mod tests {
                     score: 0.5,
                     shortcut: None,
                     file_metadata: None,
+                    icon_path: None,
                 }]
             }
         }
@@ -2963,6 +3096,7 @@ mod tests {
                     score: 0.5,
                     shortcut: None,
                     file_metadata: None,
+                    icon_path: None,
                 }]
             }
         }
@@ -2976,6 +3110,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -3017,6 +3153,7 @@ mod tests {
                     score: 0.5,
                     shortcut: Some("Enter".into()),
                     file_metadata: None,
+                    icon_path: None,
                 }]
             }
         }
@@ -3043,6 +3180,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -3148,6 +3287,7 @@ mod tests {
                     score: 0.5,
                     shortcut: Some("Enter".into()),
                     file_metadata: None,
+                    icon_path: None,
                 }]
             }
         }
@@ -3177,6 +3317,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -3233,6 +3375,7 @@ mod tests {
                     score: 0.5,
                     shortcut: Some("Enter".into()),
                     file_metadata: None,
+                    icon_path: None,
                 }]
             }
         }
@@ -3268,6 +3411,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -3312,6 +3457,7 @@ mod tests {
             score: 0.5,
             shortcut: None,
             file_metadata: None,
+            icon_path: None,
         };
         let slow_result = SearchResult {
             id: "file:slow".into(),
@@ -3323,6 +3469,7 @@ mod tests {
             score: 0.4,
             shortcut: None,
             file_metadata: None,
+            icon_path: None,
         };
 
         cache.insert(
@@ -3361,6 +3508,7 @@ mod tests {
             score: 0.5,
             shortcut: None,
             file_metadata: None,
+            icon_path: None,
         };
 
         cache.insert(
@@ -3490,6 +3638,7 @@ mod tests {
                             score: 0.5 + recent_score,
                             shortcut: Some("Enter".into()),
                             file_metadata: None,
+                            icon_path: None,
                         }
                     })
                     .collect()
@@ -3502,6 +3651,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: Some(&recent_scores),
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -3519,6 +3670,8 @@ mod tests {
         let context_without_recents = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -3555,6 +3708,7 @@ mod tests {
                         score: 0.5,
                         shortcut: None,
                         file_metadata: None,
+                        icon_path: None,
                     })
                     .collect()
             }
@@ -3566,6 +3720,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: Some(&learned_scores),
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -3581,10 +3737,105 @@ mod tests {
 
         let context_without_learned_query = SearchContext {
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             ..context
         };
         let results = core.search("a", &context_without_learned_query, 10);
         assert_eq!(results[0].id, "app:alpha");
+    }
+
+    #[test]
+    fn pinned_scores_rank_above_query_selection_scores() {
+        struct StaticProvider;
+
+        impl SearchProvider for StaticProvider {
+            fn source(&self) -> Option<SearchSource> {
+                Some(SearchSource::Apps)
+            }
+
+            fn search(&self, _query: &str, _context: &SearchContext<'_>) -> Vec<SearchResult> {
+                ["app:alpha", "app:beta"]
+                    .into_iter()
+                    .map(|id| SearchResult {
+                        id: id.into(),
+                        title: id.trim_start_matches("app:").to_string(),
+                        subtitle: format!("{id}.exe"),
+                        kind: ResultKind::App,
+                        action: ActionKind::LaunchApp,
+                        source: "测试应用".into(),
+                        score: 0.5,
+                        shortcut: None,
+                        file_metadata: None,
+                        icon_path: None,
+                    })
+                    .collect()
+            }
+        }
+
+        let core = SearchCore::new(vec![Box::new(StaticProvider)]);
+        let enabled_sources = all_search_sources();
+        let learned_scores = HashMap::from([("app:alpha".to_string(), 0.35)]);
+        let pinned_scores = HashMap::from([("app:beta".to_string(), 0.65)]);
+        let context = SearchContext {
+            recent_scores: None,
+            query_selection_scores: Some(&learned_scores),
+            pinned_scores: Some(&pinned_scores),
+            result_aliases: None,
+            custom_commands: None,
+            phrases: None,
+            web_search_templates: None,
+            password_options: None,
+            exclusion_rules: None,
+            source_weights: None,
+            enabled_sources: &enabled_sources,
+            everything_options: None,
+        };
+
+        let results = core.search("a", &context, 10);
+
+        assert_eq!(results[0].id, "app:beta");
+    }
+
+    #[test]
+    fn result_aliases_inject_matching_results_and_respect_source_filter() {
+        let core = SearchCore::new(Vec::new());
+        let aliases = vec![ResultAlias {
+            alias: "ide".into(),
+            normalized_alias: "ide".into(),
+            result_id: "app:vscode".into(),
+            kind: "app".into(),
+            title: "Visual Studio Code".into(),
+            target: r"C:\Apps\Code.exe".into(),
+            created_at: "2026-06-01T00:00:00.000Z".into(),
+            updated_at: "2026-06-01T00:00:00.000Z".into(),
+        }];
+        let app_sources = HashSet::from([SearchSource::Apps]);
+        let context = SearchContext {
+            recent_scores: None,
+            query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: Some(&aliases),
+            custom_commands: None,
+            phrases: None,
+            web_search_templates: None,
+            password_options: None,
+            exclusion_rules: None,
+            source_weights: None,
+            enabled_sources: &app_sources,
+            everything_options: None,
+        };
+
+        let results = core.search("ide", &context, 10);
+
+        assert_eq!(results[0].id, "app:vscode");
+
+        let file_sources = HashSet::from([SearchSource::Files]);
+        let context_without_apps = SearchContext {
+            enabled_sources: &file_sources,
+            ..context
+        };
+        assert!(core.search("ide", &context_without_apps, 10).is_empty());
     }
 
     #[test]
@@ -3612,6 +3863,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -3632,6 +3885,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -3666,6 +3921,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: Some(&commands),
             phrases: None,
             web_search_templates: None,
@@ -3696,6 +3953,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: Some(&phrases),
             web_search_templates: None,
@@ -3727,6 +3986,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: Some(&templates),
@@ -3764,6 +4025,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: Some(&templates),
@@ -3801,6 +4064,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: Some(&templates),
@@ -3849,6 +4114,7 @@ mod tests {
                     score: 0.5,
                     shortcut: None,
                     file_metadata: None,
+                    icon_path: None,
                 }]
             }
         }
@@ -3869,6 +4135,7 @@ mod tests {
                     score: 0.5,
                     shortcut: None,
                     file_metadata: None,
+                    icon_path: None,
                 }]
             }
         }
@@ -3882,6 +4149,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: Some(&[]),
             web_search_templates: None,
@@ -3924,6 +4193,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: Some(&commands),
             phrases: None,
             web_search_templates: None,
@@ -3952,6 +4223,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: Some(&phrases),
             web_search_templates: None,
@@ -3987,6 +4260,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: Some(&commands),
             phrases: Some(&phrases),
             web_search_templates: None,
@@ -4011,6 +4286,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -4031,6 +4308,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -4065,6 +4344,7 @@ mod tests {
                         score: 0.5,
                         shortcut: Some("Enter".into()),
                         file_metadata: None,
+                        icon_path: None,
                     }]
                 } else {
                     Vec::new()
@@ -4077,6 +4357,8 @@ mod tests {
         let context = SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,

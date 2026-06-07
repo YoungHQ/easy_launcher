@@ -105,6 +105,12 @@ const exactText: Record<string, string> = {
   "目录编辑器路径": "Folder editor path",
   "例如 C:\\Program Files\\Microsoft VS Code\\Code.exe":
     "Example: C:\\Program Files\\Microsoft VS Code\\Code.exe",
+  "未配置文件编辑器": "No file editor configured",
+  "未配置目录编辑器": "No folder editor configured",
+  "选择": "Choose",
+  "清除": "Clear",
+  "选择编辑器可执行文件；清除后隐藏对应菜单项。启动时会把当前文件或目录路径作为参数传给编辑器。":
+    "Choose the editor executable. Clear it to hide the matching menu item. The current file or folder path is passed to the editor when launched.",
   "留空则隐藏对应菜单项；启动时会把当前文件或目录路径作为参数传给编辑器。":
     "Leave blank to hide the menu item. The current file or folder path is passed to the editor when launched.",
   "目录": "Folder",

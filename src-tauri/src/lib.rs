@@ -2,6 +2,7 @@ mod ai;
 mod apps;
 mod everything;
 mod file_metadata;
+mod icons;
 mod pinyin_search;
 mod process;
 mod search;
@@ -42,8 +43,9 @@ use storage::{
     selection_conversation_title, AiAssistant, AiAssistantInput, AiConversation, AiMessage,
     AiModelProfile, AiModelProfileInput, AiProvider, AiProviderInput, AiProviderModel,
     AiProviderModelInput, AiSelectionAction, AiSelectionActionInput, CustomCommand,
-    CustomCommandInput, ExclusionRule, ExclusionRuleInput, Phrase, PhraseInput, WebSearchTemplate,
-    WebSearchTemplateInput, TRANSLATION_AI_ASSISTANT_ID,
+    CustomCommandInput, ExclusionRule, ExclusionRuleInput, Phrase, PhraseInput, PinnedResult,
+    PinnedResultInput, ResultAlias, ResultAliasInput, WebSearchTemplate, WebSearchTemplateInput,
+    TRANSLATION_AI_ASSISTANT_ID,
 };
 use storage::{Storage, StorageState, StorageStatus};
 use tauri::menu::MenuBuilder;
@@ -66,6 +68,7 @@ const AI_CHAT_ERROR_EVENT: &str = "ai-chat-error";
 const AI_CHAT_CANCELLED_EVENT: &str = "ai-chat-cancelled";
 const SETTINGS_OPENED_EVENT: &str = "settings-opened";
 const SEARCH_PROGRESS_EVENT: &str = "search-progress";
+const SEARCH_ICONS_UPDATED_EVENT: &str = "search-icons-updated";
 const TRAY_OPEN_SETTINGS_EVENT: &str = "tray-open-settings";
 const TRAY_EVERYTHING_STATUS_EVENT: &str = "tray-everything-status";
 const TRAY_MENU_OPEN: &str = "tray-open-main";
@@ -114,6 +117,7 @@ const EXPORTABLE_SETTING_KEYS: &[&str] = &[
     "search.weight.phrase",
     "search.weight.web_search",
     "search.weight.tools",
+    "search.smart_ranking.enabled",
     "everything.search.full_path",
     "everything.search.content",
     "tools.menu.alias",
@@ -241,6 +245,27 @@ struct SearchProgressEvent {
     diagnostics: SearchDiagnostics,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchIconUpdate {
+    result_id: String,
+    icon_path: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchIconsUpdatedEvent {
+    request_id: u64,
+    icons: Vec<SearchIconUpdate>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IconCacheClearResult {
+    cleared_count: usize,
+    status: icons::IconCacheStatus,
+}
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {name}. Tauri backend is connected.")
@@ -254,6 +279,26 @@ fn get_app_version(app: AppHandle) -> String {
 #[tauri::command]
 async fn check_for_updates(app: AppHandle, include_prerelease: bool) -> UpdateCheckResult {
     updates::check_for_updates(&app.package_info().version.to_string(), include_prerelease).await
+}
+
+#[tauri::command]
+fn icon_cache_status() -> Result<icons::IconCacheStatus, String> {
+    icons::icon_cache_status()
+}
+
+#[tauri::command]
+fn clear_icon_cache(
+    search_cache: tauri::State<'_, SearchResultCacheStore>,
+) -> Result<IconCacheClearResult, String> {
+    let cleared_count = icons::clear_icon_cache()?;
+    if let Ok(mut cache) = search_cache.lock() {
+        cache.clear_icon_paths();
+    }
+    let status = icons::icon_cache_status()?;
+    Ok(IconCacheClearResult {
+        cleared_count,
+        status,
+    })
 }
 
 #[tauri::command]
@@ -663,6 +708,104 @@ fn delete_exclusion_rule(
         .lock()
         .map_err(|_| "无法删除排除规则".to_string())?
         .delete_exclusion_rule(&id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_recent_items(storage: tauri::State<'_, StorageState>) -> Result<usize, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法清空最近使用记录".to_string())?
+        .clear_recent_items()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_query_selection_stats(storage: tauri::State<'_, StorageState>) -> Result<usize, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法清空查询词学习记录".to_string())?
+        .clear_query_selection_stats()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_ranking_learning(storage: tauri::State<'_, StorageState>) -> Result<usize, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法清空智能排序学习数据".to_string())?
+        .clear_ranking_learning()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_pinned_results(
+    storage: tauri::State<'_, StorageState>,
+) -> Result<Vec<PinnedResult>, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法读取固定结果".to_string())?
+        .list_pinned_results()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_result_pinned(
+    input: PinnedResultInput,
+    pinned: bool,
+    storage: tauri::State<'_, StorageState>,
+) -> Result<Option<PinnedResult>, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法更新固定结果".to_string())?
+        .set_result_pinned(input, pinned)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_pinned_result(
+    result_id: String,
+    storage: tauri::State<'_, StorageState>,
+) -> Result<bool, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法删除固定结果".to_string())?
+        .delete_pinned_result(&result_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_result_aliases(
+    storage: tauri::State<'_, StorageState>,
+) -> Result<Vec<ResultAlias>, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法读取结果 Alias".to_string())?
+        .list_result_aliases()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_result_alias(
+    input: ResultAliasInput,
+    storage: tauri::State<'_, StorageState>,
+) -> Result<ResultAlias, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法保存结果 Alias".to_string())?
+        .upsert_result_alias(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_result_alias(
+    normalized_alias: String,
+    storage: tauri::State<'_, StorageState>,
+) -> Result<bool, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法删除结果 Alias".to_string())?
+        .delete_result_alias(&normalized_alias)
         .map_err(|error| error.to_string())
 }
 
@@ -1836,6 +1979,8 @@ fn search(query: String) -> Vec<SearchResult> {
         &SearchContext {
             recent_scores: None,
             query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
             custom_commands: None,
             phrases: None,
             web_search_templates: None,
@@ -1849,7 +1994,9 @@ fn search(query: String) -> Vec<SearchResult> {
         false,
     );
     log_search_diagnostics(&execution.diagnostics);
-    execution.results
+    let mut results = execution.results;
+    icons::attach_cached_icons(&mut results);
+    results
 }
 
 #[tauri::command]
@@ -1897,6 +2044,8 @@ fn search_with_recents_blocking(
     let (
         recent_scores,
         query_selection_scores,
+        pinned_scores,
+        result_aliases,
         search_source_settings,
         search_weight_settings,
         everything_options,
@@ -1909,10 +2058,25 @@ fn search_with_recents_blocking(
     ) = {
         let storage = storage.lock().map_err(|_| "无法读取搜索数据".to_string())?;
 
-        let recent_scores = storage.recent_scores().map_err(|error| error.to_string())?;
+        let smart_ranking_enabled = bool_setting(&storage, "search.smart_ranking.enabled", true)?;
+        let recent_scores = if smart_ranking_enabled {
+            storage.recent_scores().map_err(|error| error.to_string())?
+        } else {
+            HashMap::new()
+        };
         let normalized_selection_query = normalize_selection_query(&routed_query);
-        let query_selection_scores = storage
-            .query_selection_scores(&normalized_selection_query)
+        let query_selection_scores = if smart_ranking_enabled {
+            storage
+                .query_selection_scores(&normalized_selection_query)
+                .map_err(|error| error.to_string())?
+        } else {
+            HashMap::new()
+        };
+        let pinned_scores = storage
+            .pinned_result_scores()
+            .map_err(|error| error.to_string())?;
+        let result_aliases = storage
+            .list_result_aliases()
             .map_err(|error| error.to_string())?;
         let search_source_settings = read_search_source_settings(&storage)?;
         let search_weight_settings = read_search_weight_settings(&storage)?;
@@ -1945,6 +2109,8 @@ fn search_with_recents_blocking(
         (
             recent_scores,
             query_selection_scores,
+            pinned_scores,
+            result_aliases,
             search_source_settings,
             search_weight_settings,
             everything_options,
@@ -1975,6 +2141,8 @@ fn search_with_recents_blocking(
         &everything_options,
         &recent_scores,
         &query_selection_scores,
+        &pinned_scores,
+        &result_aliases,
         &custom_commands,
         &phrases,
         &web_search_templates,
@@ -1987,6 +2155,8 @@ fn search_with_recents_blocking(
             &SearchContext {
                 recent_scores: Some(&recent_scores),
                 query_selection_scores: Some(&query_selection_scores),
+                pinned_scores: Some(&pinned_scores),
+                result_aliases: Some(&result_aliases),
                 custom_commands: Some(&custom_commands),
                 phrases: Some(&phrases),
                 web_search_templates: Some(&web_search_templates),
@@ -2002,7 +2172,8 @@ fn search_with_recents_blocking(
         );
         log_search_diagnostics(&execution.diagnostics);
 
-        return Ok(execution.results);
+        let results = finalize_search_results(execution.results, None, request_id, None);
+        return Ok(results);
     }
 
     if bypass_cache {
@@ -2011,6 +2182,8 @@ fn search_with_recents_blocking(
             &SearchContext {
                 recent_scores: Some(&recent_scores),
                 query_selection_scores: Some(&query_selection_scores),
+                pinned_scores: Some(&pinned_scores),
+                result_aliases: Some(&result_aliases),
                 custom_commands: Some(&custom_commands),
                 phrases: Some(&phrases),
                 web_search_templates: Some(&web_search_templates),
@@ -2025,7 +2198,13 @@ fn search_with_recents_blocking(
             || !is_current_search_request(&search_requests, request_id),
         );
         log_search_diagnostics(&execution.diagnostics);
-        return Ok(execution.results);
+        let results = finalize_search_results(
+            execution.results,
+            Some(app),
+            request_id,
+            Some(search_requests),
+        );
+        return Ok(results);
     }
 
     let prioritize_files = should_prioritize_file_search(&routed_query, &route, &enabled_sources);
@@ -2034,12 +2213,15 @@ fn search_with_recents_blocking(
         if prioritize_files && !cached.complete {
             return run_complete_search_with_cache(
                 &routed_query,
+                app,
                 request_id,
                 &search_requests,
                 &search_cache,
                 cache_key,
                 recent_scores,
                 query_selection_scores,
+                pinned_scores,
+                result_aliases,
                 custom_commands,
                 phrases,
                 web_search_templates,
@@ -2059,6 +2241,12 @@ fn search_with_recents_blocking(
         let diagnostics = cached_search_diagnostics(&routed_query, cached.results.len(), tier);
         log_search_diagnostics(&diagnostics);
 
+        let results = finalize_search_results(
+            cached.results,
+            Some(app.clone()),
+            request_id,
+            Some(search_requests.clone()),
+        );
         if !cached.complete && is_current_search_request(&search_requests, request_id) {
             spawn_slow_search_progress(
                 app,
@@ -2069,6 +2257,8 @@ fn search_with_recents_blocking(
                 cache_key,
                 recent_scores,
                 query_selection_scores,
+                pinned_scores,
+                result_aliases,
                 custom_commands,
                 phrases,
                 web_search_templates,
@@ -2077,22 +2267,25 @@ fn search_with_recents_blocking(
                 everything_options,
                 source_weights,
                 enabled_sources,
-                cached.results.clone(),
+                results.clone(),
             );
         }
 
-        return Ok(cached.results);
+        return Ok(results);
     }
 
     if prioritize_files {
         return run_complete_search_with_cache(
             &routed_query,
+            app,
             request_id,
             &search_requests,
             &search_cache,
             cache_key,
             recent_scores,
             query_selection_scores,
+            pinned_scores,
+            result_aliases,
             custom_commands,
             phrases,
             web_search_templates,
@@ -2110,6 +2303,8 @@ fn search_with_recents_blocking(
         &SearchContext {
             recent_scores: Some(&recent_scores),
             query_selection_scores: Some(&query_selection_scores),
+            pinned_scores: Some(&pinned_scores),
+            result_aliases: Some(&result_aliases),
             custom_commands: Some(&custom_commands),
             phrases: Some(&phrases),
             web_search_templates: Some(&web_search_templates),
@@ -2124,8 +2319,12 @@ fn search_with_recents_blocking(
         || !is_current_search_request(&search_requests, request_id),
     );
     log_search_diagnostics(&execution.diagnostics);
-    let fast_results = execution.results.clone();
-
+    let fast_results = finalize_search_results(
+        execution.results.clone(),
+        Some(app.clone()),
+        request_id,
+        Some(search_requests.clone()),
+    );
     if !execution.diagnostics.cancelled && is_current_search_request(&search_requests, request_id) {
         write_cached_search_results(
             &search_cache,
@@ -2142,6 +2341,8 @@ fn search_with_recents_blocking(
             cache_key,
             recent_scores,
             query_selection_scores,
+            pinned_scores,
+            result_aliases,
             custom_commands,
             phrases,
             web_search_templates,
@@ -2154,17 +2355,20 @@ fn search_with_recents_blocking(
         );
     }
 
-    Ok(execution.results)
+    Ok(fast_results)
 }
 
 fn run_complete_search_with_cache(
     query: &str,
+    app: AppHandle,
     request_id: u64,
     search_requests: &SearchRequestTracker,
     search_cache: &SearchResultCacheStore,
     cache_key: String,
     recent_scores: HashMap<String, f32>,
     query_selection_scores: HashMap<String, f32>,
+    pinned_scores: HashMap<String, f32>,
+    result_aliases: Vec<ResultAlias>,
     custom_commands: Vec<CustomCommand>,
     phrases: Vec<Phrase>,
     web_search_templates: Vec<WebSearchTemplate>,
@@ -2179,6 +2383,8 @@ fn run_complete_search_with_cache(
         &SearchContext {
             recent_scores: Some(&recent_scores),
             query_selection_scores: Some(&query_selection_scores),
+            pinned_scores: Some(&pinned_scores),
+            result_aliases: Some(&result_aliases),
             custom_commands: Some(&custom_commands),
             phrases: Some(&phrases),
             web_search_templates: Some(&web_search_templates),
@@ -2193,12 +2399,17 @@ fn run_complete_search_with_cache(
         || !is_current_search_request(search_requests, request_id),
     );
     log_search_diagnostics(&execution.diagnostics);
-
+    let results = finalize_search_results(
+        execution.results,
+        Some(app),
+        request_id,
+        Some(search_requests.clone()),
+    );
     if !execution.diagnostics.cancelled && is_current_search_request(search_requests, request_id) {
-        write_cached_search_results(search_cache, cache_key, execution.results.clone(), true);
+        write_cached_search_results(search_cache, cache_key, results.clone(), true);
     }
 
-    Ok(execution.results)
+    Ok(results)
 }
 
 fn spawn_slow_search_progress(
@@ -2210,6 +2421,8 @@ fn spawn_slow_search_progress(
     cache_key: String,
     recent_scores: HashMap<String, f32>,
     query_selection_scores: HashMap<String, f32>,
+    pinned_scores: HashMap<String, f32>,
+    result_aliases: Vec<ResultAlias>,
     custom_commands: Vec<CustomCommand>,
     phrases: Vec<Phrase>,
     web_search_templates: Vec<WebSearchTemplate>,
@@ -2231,6 +2444,8 @@ fn spawn_slow_search_progress(
             &SearchContext {
                 recent_scores: Some(&recent_scores),
                 query_selection_scores: Some(&query_selection_scores),
+                pinned_scores: Some(&pinned_scores),
+                result_aliases: Some(&result_aliases),
                 custom_commands: Some(&custom_commands),
                 phrases: Some(&phrases),
                 web_search_templates: Some(&web_search_templates),
@@ -2255,17 +2470,19 @@ fn spawn_slow_search_progress(
 
         let mut results = fast_results;
         results.extend(execution.results.clone());
-        let results = merge_ranked_results(results, SEARCH_RESULT_LIMIT);
+        let mut results = merge_ranked_results(results, SEARCH_RESULT_LIMIT);
+        icons::attach_cached_icons(&mut results);
         write_cached_search_results(&search_cache, cache_key, results.clone(), true);
 
         let _ = app.emit(
             SEARCH_PROGRESS_EVENT,
             SearchProgressEvent {
                 request_id,
-                results,
+                results: results.clone(),
                 diagnostics: execution.diagnostics,
             },
         );
+        spawn_search_icon_resolution(app, request_id, search_requests, results);
     });
 }
 
@@ -2287,6 +2504,61 @@ fn write_cached_search_results(
     }
 }
 
+fn finalize_search_results(
+    mut results: Vec<SearchResult>,
+    app: Option<AppHandle>,
+    request_id: u64,
+    search_requests: Option<SearchRequestTracker>,
+) -> Vec<SearchResult> {
+    icons::attach_cached_icons(&mut results);
+    if let (Some(app), Some(search_requests)) = (app, search_requests) {
+        if request_id != 0 {
+            spawn_search_icon_resolution(app, request_id, search_requests, results.clone());
+        }
+    }
+    results
+}
+
+fn spawn_search_icon_resolution(
+    app: AppHandle,
+    request_id: u64,
+    search_requests: SearchRequestTracker,
+    results: Vec<SearchResult>,
+) {
+    let requests = icons::pending_icon_requests(&results, 30);
+    if requests.is_empty() {
+        return;
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut updates = Vec::new();
+        for request in requests {
+            if !is_current_search_request(&search_requests, request_id) {
+                return;
+            }
+
+            if let Some(icon_path) = icons::resolve_icon_request(&request) {
+                updates.push(SearchIconUpdate {
+                    result_id: request.result_id,
+                    icon_path,
+                });
+            }
+        }
+
+        if updates.is_empty() || !is_current_search_request(&search_requests, request_id) {
+            return;
+        }
+
+        let _ = app.emit(
+            SEARCH_ICONS_UPDATED_EVENT,
+            SearchIconsUpdatedEvent {
+                request_id,
+                icons: updates,
+            },
+        );
+    });
+}
+
 fn search_cache_key(
     query: &str,
     sources: &std::collections::HashSet<SearchSource>,
@@ -2294,19 +2566,23 @@ fn search_cache_key(
     everything_options: &EverythingSearchOptions,
     recent_scores: &HashMap<String, f32>,
     query_selection_scores: &HashMap<String, f32>,
+    pinned_scores: &HashMap<String, f32>,
+    result_aliases: &[ResultAlias],
     custom_commands: &[CustomCommand],
     phrases: &[Phrase],
     web_search_templates: &[WebSearchTemplate],
     exclusion_rules: &[ExclusionRule],
 ) -> String {
     format!(
-        "q={}|src={}|w={}|everything={}|recent={}|learned={}|cmd={}|phrase={}|web={}|exclude={}",
+        "q={}|src={}|w={}|everything={}|recent={}|learned={}|pinned={}|alias={}|cmd={}|phrase={}|web={}|exclude={}",
         query.trim().to_lowercase(),
         search_source_signature(sources),
         search_weight_signature(weights),
         everything_options_signature(everything_options),
         recent_scores_signature(recent_scores),
         query_selection_scores_signature(query_selection_scores),
+        recent_scores_signature(pinned_scores),
+        result_aliases_signature(result_aliases),
         custom_commands_signature(custom_commands),
         phrases_signature(phrases),
         web_search_templates_signature(web_search_templates),
@@ -2361,6 +2637,19 @@ fn recent_scores_signature(scores: &HashMap<String, f32>) -> String {
 
 fn query_selection_scores_signature(scores: &HashMap<String, f32>) -> String {
     recent_scores_signature(scores)
+}
+
+fn result_aliases_signature(aliases: &[ResultAlias]) -> String {
+    aliases
+        .iter()
+        .map(|alias| {
+            format!(
+                "{}:{}:{}:{}",
+                alias.normalized_alias, alias.result_id, alias.kind, alias.updated_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn custom_commands_signature(commands: &[CustomCommand]) -> String {
@@ -2541,6 +2830,11 @@ fn execute_result(
         ActionKind::OpenFile => {
             launch_app(&result.subtitle)?;
             record_selection()?;
+            storage
+                .lock()
+                .map_err(|_| "无法记录最近使用".to_string())?
+                .record_recent_item(&result.id, "file", &result.title, &result.subtitle)
+                .map_err(|error| error.to_string())?;
             Ok(())
         }
         ActionKind::CopyText => {
@@ -3255,6 +3549,7 @@ fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
         | "search.source.phrase"
         | "search.source.web_search"
         | "search.source.tools"
+        | "search.smart_ranking.enabled"
         | "everything.search.full_path"
         | "everything.search.content"
         | "tools.password.uppercase"
@@ -4112,6 +4407,10 @@ pub fn run() {
             cancel_ai_chat_message,
             capture_selection,
             check_for_updates,
+            clear_icon_cache,
+            clear_query_selection_stats,
+            clear_ranking_learning,
+            clear_recent_items,
             copy_file_to_clipboard,
             copy_path,
             delete_path,
@@ -4120,6 +4419,8 @@ pub fn run() {
             delete_ai_message,
             delete_ai_model_profile,
             delete_ai_provider,
+            delete_pinned_result,
+            delete_result_alias,
             everything_status,
             execute_result,
             export_config,
@@ -4131,6 +4432,7 @@ pub fn run() {
             get_search_source_settings,
             get_search_weight_settings,
             get_everything_search_options,
+            icon_cache_status,
             get_ai_config,
             list_ai_assistants,
             list_ai_conversations,
@@ -4141,6 +4443,8 @@ pub fn run() {
             list_ai_providers,
             list_ai_selection_actions,
             list_enabled_ai_provider_models,
+            list_pinned_results,
+            list_result_aliases,
             list_visible_ai_selection_actions,
             greet,
             launcher_shortcut_status,
@@ -4172,6 +4476,7 @@ pub fn run() {
             set_search_source_settings,
             set_search_weight_settings,
             set_password_options,
+            set_result_pinned,
             set_everything_exe_path,
             set_everything_search_options,
             set_startup_enabled,
@@ -4203,6 +4508,7 @@ pub fn run() {
             delete_web_search_template,
             list_exclusion_rules,
             save_exclusion_rule,
+            save_result_alias,
             delete_exclusion_rule,
             test_ai_model_profile
         ])
@@ -4441,6 +4747,8 @@ mod tests {
             &EverythingSearchOptions::default(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            &[],
             &[],
             &[],
             &[],
@@ -4456,6 +4764,8 @@ mod tests {
             },
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            &[],
             &[],
             &[],
             &[],
@@ -4523,6 +4833,8 @@ mod tests {
             &EverythingSearchOptions::default(),
             &recent_scores,
             &HashMap::new(),
+            &HashMap::new(),
+            &[],
             &[],
             &[],
             &[],
@@ -4535,6 +4847,8 @@ mod tests {
             &EverythingSearchOptions::default(),
             &changed_recent_scores,
             &HashMap::new(),
+            &HashMap::new(),
+            &[],
             &[],
             &[],
             &[],
@@ -4551,6 +4865,8 @@ mod tests {
                 &EverythingSearchOptions::default(),
                 &recent_scores,
                 &HashMap::new(),
+                &HashMap::new(),
+                &[],
                 &[],
                 &[],
                 &[],
@@ -4566,6 +4882,8 @@ mod tests {
                 &EverythingSearchOptions::default(),
                 &recent_scores,
                 &query_selection_scores,
+                &HashMap::new(),
+                &[],
                 &[],
                 &[],
                 &[],
@@ -4606,6 +4924,8 @@ mod tests {
             &EverythingSearchOptions::default(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            &[],
             &[],
             &[],
             &[],
@@ -4618,6 +4938,8 @@ mod tests {
             &EverythingSearchOptions::default(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            &[],
             &[],
             &[],
             &[],
