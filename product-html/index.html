@@ -386,11 +386,13 @@
           <p class="lead">
             Easy Launcher 是一个基于 Tauri 2、Rust、React、TypeScript 和 Vite 构建的 Windows 桌面启动器。
             它把应用启动、文件搜索、系统命令、快捷短语、网页搜索、工具命令、AI 文本处理和可配置快捷入口集中在一个紧凑入口里。
+            日常使用可以双击 <code>Alt</code> 呼出主窗口，也可以按住 <code>Ctrl</code> 后用鼠标划词，直接唤起 AI 小对话框处理选中文本。
           </p>
           <div class="meta-row">
             <span class="pill">当前版本：v0.2.0</span>
-            <span class="pill">默认主快捷键：Alt+1</span>
-            <span class="pill">默认 AI 快捷键：Alt+3</span>
+            <span class="pill">主入口：双击 Alt / Alt+1</span>
+            <span class="pill">划词 AI：Ctrl + 鼠标划词</span>
+            <span class="pill">AI 面板：Alt+3</span>
             <span class="pill">快捷入口 Alias：/</span>
             <span class="pill">MSI 打包：Tauri 2</span>
             <span class="pill">文件搜索：Everything IPC/HTTP</span>
@@ -403,6 +405,10 @@
             <div class="info-card">
               <strong>快速搜索</strong>
               <span>支持应用、文件、命令、计算器、快捷短语、网页搜索、工具命令和 AI 动作。</span>
+            </div>
+            <div class="info-card">
+              <strong>划词 AI</strong>
+              <span>按住 Ctrl 用鼠标划词，松开后呼出 AI 小对话框，可直接翻译、总结、解释和润色。</span>
             </div>
             <div class="info-card">
               <strong>Slash Board</strong>
@@ -481,7 +487,8 @@
         <section class="section" id="launcher">
           <h2>主启动器使用</h2>
           <ol>
-            <li>按 <code>Alt+1</code> 打开或隐藏启动器主窗口，隐藏后只保留系统托盘入口，不占用任务栏。</li>
+            <li>双击 <code>Alt</code> 可快速打开启动器主窗口；也可以按 <code>Alt+1</code> 打开或隐藏主窗口。</li>
+            <li>隐藏后只保留系统托盘入口，不占用任务栏。</li>
             <li>输入关键词搜索应用、文件、命令、计算器结果、快捷短语、网页搜索或 AI 动作。</li>
             <li>使用方向键选择结果，按 <code>Enter</code> 执行主动作。</li>
             <li>右键结果或按 <code>Shift+Enter</code> 打开上下文菜单，可执行打开目录、资源管理器选中、复制路径/名称/文件本体、打开方式、配置编辑器、快速访问、当前目录终端、管理员运行、以其他用户运行、删除和隐藏等次级动作。</li>
@@ -620,8 +627,8 @@
           <h2>划词菜单和 AI 动作</h2>
           <ol>
             <li>按 <code>Alt+3</code> 打开 AI 面板，进行普通对话。</li>
-            <li>开启划词功能后，可在任意应用中选中文本并触发划词 AI 小对话框。</li>
-            <li>当前支持的划词触发模式是 <code>Ctrl + 鼠标划词</code>：按住 <code>Ctrl</code> 并用鼠标拖选文本，松开鼠标后自动呼出。</li>
+            <li>开启划词功能后，可在任意应用中按住 <code>Ctrl</code> 并用鼠标拖选文本。</li>
+            <li>松开鼠标后会自动呼出划词 AI 小对话框，对选中的内容执行快捷处理。</li>
             <li>划词动作包括翻译、总结、专业解释、润色和提取要点；可在设置中控制每个动作是否显示。</li>
             <li>取词会临时模拟 <code>Ctrl+C</code>，等待系统剪贴板内容变化后恢复原文本剪贴板。</li>
           </ol>
@@ -773,8 +780,10 @@ cargo test --manifest-path src-tauri\Cargo.toml</code></pre>
 
           <h3>建议手动验证</h3>
           <ul>
+            <li>双击 <code>Alt</code> 呼出主窗口。</li>
             <li><code>Alt+1</code> 呼出和隐藏主窗口。</li>
             <li>修改主快捷键后无需重启即可生效。</li>
+            <li>按住 <code>Ctrl</code> 并用鼠标划词，松开后应呼出划词 AI 小对话框。</li>
             <li>输入 <code>/</code> 打开 Slash Board，验证范围切换、拖拽排序和隐藏范围。</li>
             <li>输入 <code>/tools</code> 选择 <code>enc</code> 后，输入框应进入 <code>/tools enc </code>。</li>
             <li>搜索并启动 3 个本机应用。</li>

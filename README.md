@@ -4,14 +4,23 @@ Easy Launcher 是一个 Windows-first 桌面启动器。按下快捷键后，可
 
 更完整的产品说明见：[产品文档](https://younghq.github.io/easy_launcher/)。
 
+## 截图
+
+![主搜索界面](assets/screenshots/launcher-search.png)
+
+![划词 AI](assets/screenshots/selection-ai.png)
+
+![Slash Board](assets/screenshots/slash-board.png)
+
 ## 核心功能
 
-- `Alt+1` 呼出或隐藏主启动器。
+- 双击 `Alt` 或按 `Alt+1` 呼出/隐藏主启动器。
 - 搜索并启动开始菜单、桌面、常见安装目录和 PATH 中的应用。
 - 集成 Everything 文件搜索，支持打开文件、打开所在目录和复制路径。
 - 支持计算器、系统命令、网页搜索、自定义命令和快捷短语。
-- 选中文本后按 `Ctrl+Shift+Space` 呼出划词菜单。
-- 划词菜单支持翻译、总结、解释、网页搜索和复制。
+- 输入快捷入口 Alias `/` 打开 Slash Board，可聚合命令、短语、网页模板、工具和最近打开。
+- 按 `Alt+3` 打开 AI 面板；启用划词后可通过 `Ctrl + 鼠标划词` 呼出划词 AI 小对话框。
+- 划词动作支持翻译、总结、专业解释、润色和提取要点。
 - AI 使用 OpenAI 兼容 Chat Completions 接口，支持流式输出和取消。
 - 支持搜索源开关、快捷键设置、AI 配置、开机自启动、配置导入导出和手动检查更新。
 
@@ -84,6 +93,10 @@ npm run tauri -- build
 - AI 功能需要用户自行配置可用的 OpenAI 兼容服务。
 - 划词取词通过模拟 `Ctrl+C` 实现，部分应用可能禁止复制或无法读取选中文本。
 - MSI 暂未签名，Windows 可能显示 SmartScreen 或安全提示。
+
+## 致谢
+
+- 社区：[Linux.do](https://linux.do)
 
 ## 许可证
 
