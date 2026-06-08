@@ -777,6 +777,134 @@ button {
   line-height: 1.35;
 }
 
+.slashBoardSettings {
+  display: grid;
+  gap: 6px;
+  padding: 7px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface-subtle);
+}
+
+.slashBoardSettingsHeader,
+.slashBoardSettingsItem label,
+.slashBoardSettingsHandle {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.slashBoardSettingsHeader {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.slashBoardSettingsHeader strong {
+  color: var(--color-text);
+  font-size: 12px;
+}
+
+.slashBoardSettingsHeader small,
+.slashBoardSettingsItem small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-muted-text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slashBoardSettingsList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(4, minmax(30px, auto));
+  grid-auto-flow: column;
+  gap: 5px;
+}
+
+.slashBoardSettingsItem {
+  min-height: 30px;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 5px 4px 7px;
+  border: 1px solid rgba(41, 57, 74, 0.08);
+  border-radius: 5px;
+  background: var(--color-panel);
+}
+
+.slashBoardSettingsItem.dragging {
+  border-color: rgba(99, 139, 195, 0.38);
+  background: var(--color-accent-soft);
+  opacity: 0.72;
+}
+
+.slashBoardSettingsOrder {
+  width: 24px;
+  color: var(--color-muted-text);
+  font-size: 11px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.slashBoardSettingsItem label {
+  flex: 1 1 auto;
+  gap: 6px;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.slashBoardSettingsItem input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.slashBoardSettingsItem span {
+  color: var(--color-text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.slashBoardSettingsHandle {
+  width: 24px;
+  height: 22px;
+  justify-content: center;
+  flex-direction: column;
+  gap: 3px;
+  padding: 0;
+  border-radius: 5px;
+  background: var(--color-surface);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.slashBoardSettingsHandle:hover,
+.slashBoardSettingsHandle:focus-visible {
+  background: var(--color-accent-soft);
+  outline: 0;
+}
+
+.slashBoardSettingsHandle:active {
+  cursor: grabbing;
+}
+
+.slashBoardSettingsHandle span {
+  width: 12px;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--color-muted-text);
+}
+
+.slashBoardSettingsHandle:hover span,
+.slashBoardSettingsHandle:focus-visible span {
+  background: var(--color-text);
+}
+
 .everythingStatusGuide {
   display: grid;
   gap: 3px;
@@ -1380,6 +1508,171 @@ button {
 
 .warnDot {
   background: var(--color-danger);
+}
+
+.slashBoardMode {
+  background: var(--color-background);
+}
+
+.slashBoard {
+  min-height: 0;
+  height: 322px;
+  display: grid;
+  grid-template-columns: 108px minmax(0, 1fr);
+  overflow: hidden;
+  border-radius: 0 0 9px 9px;
+  background: var(--color-background);
+}
+
+.slashBoardRail {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  overflow: hidden;
+  padding: 7px;
+  border-right: 1px solid rgba(41, 57, 74, 0.08);
+  background: var(--color-surface);
+}
+
+.slashBoardScope {
+  width: 100%;
+  min-height: 29px;
+  display: grid;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--color-muted-text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.slashBoardScope:hover,
+.slashBoardScope.active {
+  background: var(--color-panel);
+  color: var(--color-text);
+}
+
+.slashBoardScope.active {
+  box-shadow: inset 3px 0 0 var(--color-accent);
+}
+
+.slashBoardScope span {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slashBoardPane {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 38px minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--color-background);
+}
+
+.slashBoardHeader {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px 5px 10px;
+  border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+  background: var(--color-surface-subtle);
+}
+
+.slashBoardHeader span {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.slashBoardHeader strong,
+.slashBoardHeader small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slashBoardHeader strong {
+  color: var(--color-text);
+  font-size: 13px;
+}
+
+.slashBoardHeader small {
+  color: var(--color-muted-text);
+  font-size: 11px;
+}
+
+.slashBoardHeader code {
+  min-width: 0;
+  max-width: 120px;
+  overflow: hidden;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+  font-size: 11px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slashBoardResults {
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  overflow: auto;
+  padding: 5px 6px 10px;
+}
+
+.slashBoardResultItem {
+  min-height: 38px;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 5px;
+}
+
+.slashBoardResultItem .resultIcon {
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  font-size: 10px;
+}
+
+.slashBoardResultItem .resultText {
+  gap: 1px;
+}
+
+.slashBoardResultItem .resultText strong {
+  font-size: 13px;
+}
+
+.slashBoardResultItem .resultText small,
+.slashBoardResultItem .resultAction {
+  font-size: 11px;
+}
+
+.slashBoardResultItem .fileMetaLine {
+  display: none;
+}
+
+.slashBoardEmpty {
+  min-height: 160px;
+  display: grid;
+  place-items: center;
+  color: var(--color-muted-text);
+  font-size: 12px;
 }
 
 .resultList {

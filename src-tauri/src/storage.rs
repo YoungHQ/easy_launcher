@@ -121,6 +121,17 @@ pub struct WebSearchTemplateInput {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RecentItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub target: String,
+    pub use_count: i64,
+    pub last_used_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExclusionRule {
     pub id: String,
     pub match_type: String,
@@ -449,6 +460,24 @@ impl Storage {
         Ok(())
     }
 
+    pub fn list_recent_items(&self, limit: usize) -> Result<Vec<RecentItem>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let bounded_limit = limit.min(100) as i64;
+        let mut statement = self.connection.prepare(
+            "SELECT id, kind, title, target, use_count, last_used_at
+             FROM recent_items
+             ORDER BY last_used_at DESC, use_count DESC, title COLLATE NOCASE ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![bounded_limit], recent_item_from_row)?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
     pub fn recent_scores(&self) -> Result<HashMap<String, f32>, StorageError> {
         self.recent_scores_at("now")
     }
@@ -655,7 +684,7 @@ impl Storage {
             .map(|value| value.trim().eq_ignore_ascii_case(&normalized_alias))
             .unwrap_or(false);
         if tool_menu_alias_conflict {
-            return Err(StorageError::Validation("Alias 与工具总入口冲突".into()));
+            return Err(StorageError::Validation("Alias 与快捷入口冲突".into()));
         }
 
         let web_keyword_conflict = self
@@ -2147,6 +2176,17 @@ fn web_search_template_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Web
     })
 }
 
+fn recent_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecentItem> {
+    Ok(RecentItem {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        target: row.get(3)?,
+        use_count: row.get(4)?,
+        last_used_at: row.get(5)?,
+    })
+}
+
 fn exclusion_rule_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExclusionRule> {
     Ok(ExclusionRule {
         id: row.get(0)?,
@@ -2637,6 +2677,10 @@ fn seed_defaults(connection: &Connection) -> Result<(), StorageError> {
         ("everything.search.full_path", "false"),
         ("everything.search.content", "false"),
         ("tools.menu.alias", "/"),
+        (
+            "slash.board.scopes",
+            r#"[{"id":"all","visible":true},{"id":"run","visible":true},{"id":"text","visible":true},{"id":"web","visible":true},{"id":"tools","visible":true},{"id":"recent","visible":true},{"id":"open","visible":true},{"id":"system","visible":true}]"#,
+        ),
         ("tools.password.length", "16"),
         ("tools.password.uppercase", "true"),
         ("tools.password.lowercase", "true"),
@@ -3220,6 +3264,41 @@ mod tests {
         let scores = storage.recent_scores().expect("read recent scores");
 
         assert_eq!(scores.get("app:test").copied(), Some(0.1));
+    }
+
+    #[test]
+    fn lists_recent_items_by_last_used_with_limit() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage {
+            database_path: PathBuf::from("memory"),
+            connection,
+        };
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO recent_items (id, kind, title, target, use_count, last_used_at)
+                 VALUES
+                    ('app:old', 'app', 'Old App', 'old.exe', 3, '2026-06-01T00:00:00.000Z'),
+                    ('file:new', 'file', 'New Folder', 'C:\\New', 1, '2026-06-03T00:00:00.000Z'),
+                    ('app:middle', 'app', 'Middle App', 'middle.exe', 2, '2026-06-02T00:00:00.000Z')",
+                [],
+            )
+            .expect("insert recent items");
+
+        let items = storage.list_recent_items(2).expect("list recent items");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file:new", "app:middle"]
+        );
+        assert_eq!(items[0].kind, "file");
+        assert_eq!(items[0].target, r"C:\New");
+        assert_eq!(storage.list_recent_items(0).expect("list none").len(), 0);
     }
 
     #[test]

@@ -4,7 +4,9 @@ use crate::everything::{
 };
 use crate::file_metadata::{read_file_metadata, FileMetadata};
 use crate::pinyin_search::{pinyin_match_score, pinyin_matches};
-use crate::storage::{CustomCommand, ExclusionRule, Phrase, ResultAlias, WebSearchTemplate};
+use crate::storage::{
+    CustomCommand, ExclusionRule, Phrase, RecentItem, ResultAlias, WebSearchTemplate,
+};
 use crate::tools::{tool_results, PasswordOptions, ToolAction};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -22,6 +24,7 @@ const EVERYTHING_GENERAL_SEARCH_LIMIT: usize = 30;
 const EVERYTHING_DIRECTORY_SEARCH_LIMIT: usize = 60;
 const EVERYTHING_PATH_ONLY_FILE_LIMIT: usize = 5;
 const EVERYTHING_PATH_SUPPLEMENT_LIMIT: usize = 30;
+const MAX_QUICK_ENTRY_RECENT_RESULTS: usize = 8;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,6 +99,27 @@ pub struct ActionKeywordRoute {
     pub query: String,
     pub sources: Option<HashSet<SearchSource>>,
     pub keyword: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuickEntryCategory {
+    Cmd,
+    Phrase,
+    Web,
+    Tools,
+    RecentApps,
+    RecentFolders,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QuickEntryRoute {
+    Categories {
+        filter: String,
+    },
+    Category {
+        category: QuickEntryCategory,
+        query: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -535,6 +559,28 @@ pub fn parse_web_search_template_query(
     Some((template, search_query.to_string()))
 }
 
+fn parse_web_search_template_direct_query(
+    query: &str,
+    templates: &[WebSearchTemplate],
+) -> Option<(WebSearchTemplate, String)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+
+    let (keyword, rest) = split_action_keyword(query)?;
+    let template = templates
+        .iter()
+        .find(|template| template.keyword.eq_ignore_ascii_case(keyword))?
+        .clone();
+    let search_query = rest.trim();
+    if search_query.is_empty() {
+        return None;
+    }
+
+    Some((template, search_query.to_string()))
+}
+
 fn web_search_input_query(query: &str) -> &str {
     web_search_input_query_with_route(query).0
 }
@@ -564,6 +610,331 @@ pub fn apply_action_keyword_route(
         .intersection(route_sources)
         .copied()
         .collect::<HashSet<_>>()
+}
+
+pub fn parse_quick_entry_query(query: &str, alias: &str) -> Option<QuickEntryRoute> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return None;
+    }
+
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let rest = trimmed.strip_prefix(alias)?.trim();
+    if rest.is_empty() {
+        return Some(QuickEntryRoute::Categories {
+            filter: String::new(),
+        });
+    }
+
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let key = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let query = parts.next().unwrap_or_default().trim().to_string();
+
+    if let Some(category) = QuickEntryCategory::from_key(&key) {
+        return Some(QuickEntryRoute::Category { category, query });
+    }
+
+    Some(QuickEntryRoute::Categories {
+        filter: rest.to_string(),
+    })
+}
+
+pub fn quick_entry_results(
+    route: &QuickEntryRoute,
+    context: &SearchContext<'_>,
+) -> Vec<SearchResult> {
+    quick_entry_results_with_recents(route, context, &[])
+}
+
+pub fn quick_entry_results_with_recents(
+    route: &QuickEntryRoute,
+    context: &SearchContext<'_>,
+    recent_items: &[RecentItem],
+) -> Vec<SearchResult> {
+    let mut results = match route {
+        QuickEntryRoute::Categories { filter } => quick_entry_category_results(filter),
+        QuickEntryRoute::Category { category, query } => match category {
+            QuickEntryCategory::Cmd => quick_entry_custom_command_results(query, context),
+            QuickEntryCategory::Phrase => quick_entry_phrase_results(query, context),
+            QuickEntryCategory::Web => quick_entry_web_results(query, context),
+            QuickEntryCategory::Tools => quick_entry_tool_results(query, context),
+            QuickEntryCategory::RecentApps => {
+                quick_entry_recent_app_results(query, context, recent_items)
+            }
+            QuickEntryCategory::RecentFolders => {
+                quick_entry_recent_folder_results(query, context, recent_items)
+            }
+        },
+    };
+
+    filter_excluded_results(&mut results, context.exclusion_rules);
+    results.sort_by(|left, right| compare_results(left, right));
+    results
+}
+
+impl QuickEntryCategory {
+    fn all() -> [Self; 6] {
+        [
+            Self::Cmd,
+            Self::Phrase,
+            Self::Web,
+            Self::Tools,
+            Self::RecentApps,
+            Self::RecentFolders,
+        ]
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "cmd" => Some(Self::Cmd),
+            "phrase" => Some(Self::Phrase),
+            "web" => Some(Self::Web),
+            "tools" => Some(Self::Tools),
+            "recent-apps" => Some(Self::RecentApps),
+            "recent-folders" => Some(Self::RecentFolders),
+            _ => None,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Cmd => "cmd",
+            Self::Phrase => "phrase",
+            Self::Web => "web",
+            Self::Tools => "tools",
+            Self::RecentApps => "recent-apps",
+            Self::RecentFolders => "recent-folders",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::Cmd => "Commands · 自定义命令",
+            Self::Phrase => "Phrases · 短语",
+            Self::Web => "Web Search · 网页搜索",
+            Self::Tools => "Tools · 工具",
+            Self::RecentApps => "Recent Apps · 最近应用",
+            Self::RecentFolders => "Recent Folders · 最近文件夹",
+        }
+    }
+
+    fn score(self) -> f32 {
+        match self {
+            Self::Cmd => 1.00,
+            Self::Phrase => 0.99,
+            Self::Web => 0.98,
+            Self::Tools => 0.97,
+            Self::RecentApps => 0.96,
+            Self::RecentFolders => 0.95,
+        }
+    }
+
+    fn matches_filter(self, filter: &str) -> bool {
+        let filter = normalize_query(filter);
+        filter.is_empty()
+            || self.key().contains(&filter)
+            || self.subtitle().to_lowercase().contains(&filter)
+    }
+}
+
+fn quick_entry_category_results(filter: &str) -> Vec<SearchResult> {
+    QuickEntryCategory::all()
+        .into_iter()
+        .filter(|category| category.matches_filter(filter))
+        .map(|category| SearchResult {
+            id: format!("quick-entry-category:{}", category.key()),
+            title: category.key().into(),
+            subtitle: category.subtitle().into(),
+            kind: ResultKind::Command,
+            action: ActionKind::RunCommand,
+            source: "快捷入口".into(),
+            score: category.score(),
+            shortcut: Some("Enter".into()),
+            file_metadata: None,
+            icon_path: None,
+        })
+        .collect()
+}
+
+fn quick_entry_custom_command_results(
+    query: &str,
+    context: &SearchContext<'_>,
+) -> Vec<SearchResult> {
+    if !context.enabled_sources.contains(&SearchSource::System) {
+        return Vec::new();
+    }
+
+    let Some(commands) = context.custom_commands else {
+        return Vec::new();
+    };
+
+    let query = normalize_query(query);
+    commands
+        .iter()
+        .filter(|command| {
+            query.is_empty()
+                || matches_search_text(&query, &command.name, &command.target)
+                || command.command_type.to_lowercase().contains(&query)
+        })
+        .map(|command| custom_command_result(command, context))
+        .collect()
+}
+
+fn quick_entry_phrase_results(query: &str, context: &SearchContext<'_>) -> Vec<SearchResult> {
+    if !context.enabled_sources.contains(&SearchSource::Phrase) {
+        return Vec::new();
+    }
+
+    let Some(phrases) = context.phrases else {
+        return Vec::new();
+    };
+
+    let query = normalize_query(query);
+    phrases
+        .iter()
+        .filter(|phrase| matches_search_text(&query, &phrase.title, &phrase.text))
+        .map(phrase_result)
+        .collect()
+}
+
+fn quick_entry_web_results(query: &str, context: &SearchContext<'_>) -> Vec<SearchResult> {
+    if !context.enabled_sources.contains(&SearchSource::WebSearch) {
+        return Vec::new();
+    }
+
+    let Some(templates) = context.web_search_templates else {
+        return Vec::new();
+    };
+
+    let query = query.trim();
+    if let Some((template, search_query)) = parse_web_search_template_direct_query(query, templates)
+    {
+        return vec![web_search_result(&template, &search_query, 0.9)];
+    }
+
+    let normalized_query = normalize_query(query);
+    templates
+        .iter()
+        .filter(|template| {
+            normalized_query.is_empty()
+                || matches_search_text(&normalized_query, &template.keyword, &template.name)
+                || template
+                    .url_template
+                    .to_lowercase()
+                    .contains(&normalized_query)
+        })
+        .map(web_search_template_entry_result)
+        .collect()
+}
+
+fn quick_entry_tool_results(query: &str, context: &SearchContext<'_>) -> Vec<SearchResult> {
+    if !context.enabled_sources.contains(&SearchSource::Tools) {
+        return Vec::new();
+    }
+
+    let password_options = context.password_options.cloned().unwrap_or_default();
+    let tool_query = if query.trim().is_empty() {
+        "/"
+    } else {
+        query.trim()
+    };
+
+    tool_results(tool_query, &password_options, "/")
+        .into_iter()
+        .map(tool_result_to_search_result)
+        .collect()
+}
+
+fn quick_entry_recent_app_results(
+    query: &str,
+    context: &SearchContext<'_>,
+    recent_items: &[RecentItem],
+) -> Vec<SearchResult> {
+    if !context.enabled_sources.contains(&SearchSource::Apps) {
+        return Vec::new();
+    }
+
+    let query = normalize_query(query);
+    recent_items
+        .iter()
+        .filter(|item| is_recent_app_item(item))
+        .filter(|item| matches_search_text(&query, &item.title, &item.target))
+        .take(MAX_QUICK_ENTRY_RECENT_RESULTS)
+        .enumerate()
+        .map(|(index, item)| recent_app_result(item, index))
+        .collect()
+}
+
+fn quick_entry_recent_folder_results(
+    query: &str,
+    context: &SearchContext<'_>,
+    recent_items: &[RecentItem],
+) -> Vec<SearchResult> {
+    if !context.enabled_sources.contains(&SearchSource::Files) {
+        return Vec::new();
+    }
+
+    let query = normalize_query(query);
+    recent_items
+        .iter()
+        .filter(|item| is_recent_folder_item(item))
+        .filter(|item| matches_search_text(&query, &item.title, &item.target))
+        .take(MAX_QUICK_ENTRY_RECENT_RESULTS)
+        .enumerate()
+        .map(|(index, item)| recent_folder_result(item, index))
+        .collect()
+}
+
+fn is_recent_app_item(item: &RecentItem) -> bool {
+    item.kind == "app"
+        && Path::new(&item.target)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("lnk")
+            })
+}
+
+fn is_recent_folder_item(item: &RecentItem) -> bool {
+    item.kind == "file" && Path::new(&item.target).is_dir()
+}
+
+fn recent_app_result(item: &RecentItem, index: usize) -> SearchResult {
+    SearchResult {
+        id: item.id.clone(),
+        title: item.title.clone(),
+        subtitle: item.target.clone(),
+        kind: ResultKind::App,
+        action: ActionKind::LaunchApp,
+        source: "最近应用".into(),
+        score: recent_entry_score(index, item.use_count),
+        shortcut: Some("Enter".into()),
+        file_metadata: None,
+        icon_path: None,
+    }
+}
+
+fn recent_folder_result(item: &RecentItem, index: usize) -> SearchResult {
+    SearchResult {
+        id: item.id.clone(),
+        title: item.title.clone(),
+        subtitle: item.target.clone(),
+        kind: ResultKind::File,
+        action: ActionKind::OpenFile,
+        source: "最近目录".into(),
+        score: recent_entry_score(index, item.use_count),
+        shortcut: Some("Enter".into()),
+        file_metadata: Some(read_file_metadata(&item.target)),
+        icon_path: None,
+    }
+}
+
+fn recent_entry_score(index: usize, use_count: i64) -> f32 {
+    0.86 - (index as f32 * 0.01) + (use_count.min(5) as f32 * 0.001)
 }
 
 fn split_action_keyword(query: &str) -> Option<(&str, &str)> {
@@ -787,27 +1158,9 @@ impl SearchProvider for ToolProvider {
 
     fn search(&self, query: &str, context: &SearchContext<'_>) -> Vec<SearchResult> {
         let password_options = context.password_options.cloned().unwrap_or_default();
-        tool_results(query, &password_options, "/")
+        tool_results(query, &password_options, "")
             .into_iter()
-            .map(|result| {
-                let action = match result.action {
-                    ToolAction::Enter { .. } => ActionKind::RunCommand,
-                    ToolAction::Copy { .. } => ActionKind::CopyText,
-                };
-
-                SearchResult {
-                    id: result.id,
-                    title: result.title,
-                    subtitle: result.subtitle,
-                    kind: ResultKind::Tool,
-                    action,
-                    source: "工具".into(),
-                    score: 0.96,
-                    shortcut: Some("Enter".into()),
-                    file_metadata: None,
-                    icon_path: None,
-                }
-            })
+            .map(tool_result_to_search_result)
             .collect()
     }
 }
@@ -831,18 +1184,7 @@ impl SearchProvider for PhraseProvider {
         phrases
             .iter()
             .filter(|phrase| matches_search_text(query, &phrase.title, &phrase.text))
-            .map(|phrase| SearchResult {
-                id: phrase.id.clone(),
-                title: phrase.title.clone(),
-                subtitle: phrase.text.clone(),
-                kind: ResultKind::Command,
-                action: ActionKind::CopyText,
-                source: "快捷短语".into(),
-                score: 0.57 + (phrase.use_count.min(10) as f32 * 0.01),
-                shortcut: Some("Enter".into()),
-                file_metadata: None,
-                icon_path: None,
-            })
+            .map(phrase_result)
             .collect()
     }
 }
@@ -914,6 +1256,21 @@ fn web_search_result(template: &WebSearchTemplate, query: &str, score: f32) -> S
         action: ActionKind::OpenUrl,
         source: "网页搜索".into(),
         score,
+        shortcut: Some("Enter".into()),
+        file_metadata: None,
+        icon_path: None,
+    }
+}
+
+fn web_search_template_entry_result(template: &WebSearchTemplate) -> SearchResult {
+    SearchResult {
+        id: format!("quick-entry-web-template:{}", template.id),
+        title: template.keyword.clone(),
+        subtitle: format!("{} · {}", template.name, template.url_template),
+        kind: ResultKind::WebSearch,
+        action: ActionKind::RunCommand,
+        source: "网页搜索模板".into(),
+        score: 0.82,
         shortcut: Some("Enter".into()),
         file_metadata: None,
         icon_path: None,
@@ -2266,27 +2623,75 @@ fn custom_command_results(
 ) -> Vec<SearchResult> {
     commands
         .iter()
-        .map(|command| {
-            let recent_score = context
-                .recent_scores
-                .and_then(|scores| scores.get(&command.id))
-                .copied()
-                .unwrap_or(0.0);
-
-            SearchResult {
-                id: command.id.clone(),
-                title: command.name.clone(),
-                subtitle: command.target.clone(),
-                kind: ResultKind::Command,
-                action: ActionKind::RunCommand,
-                source: format!("自定义命令 · {}", command.command_type),
-                score: 0.56 + recent_score,
-                shortcut: Some("Enter".into()),
-                file_metadata: None,
-                icon_path: None,
-            }
-        })
+        .map(|command| custom_command_result(command, context))
         .collect()
+}
+
+fn custom_command_result(command: &CustomCommand, context: &SearchContext<'_>) -> SearchResult {
+    let recent_score = context
+        .recent_scores
+        .and_then(|scores| scores.get(&command.id))
+        .copied()
+        .unwrap_or(0.0);
+
+    SearchResult {
+        id: command.id.clone(),
+        title: command.name.clone(),
+        subtitle: command.target.clone(),
+        kind: ResultKind::Command,
+        action: ActionKind::RunCommand,
+        source: format!("自定义命令 · {}", command.command_type),
+        score: 0.56 + recent_score,
+        shortcut: Some("Enter".into()),
+        file_metadata: None,
+        icon_path: None,
+    }
+}
+
+fn phrase_result(phrase: &Phrase) -> SearchResult {
+    SearchResult {
+        id: phrase.id.clone(),
+        title: phrase.title.clone(),
+        subtitle: phrase.text.clone(),
+        kind: ResultKind::Command,
+        action: ActionKind::CopyText,
+        source: "快捷短语".into(),
+        score: 0.57 + (phrase.use_count.min(10) as f32 * 0.01),
+        shortcut: Some("Enter".into()),
+        file_metadata: None,
+        icon_path: None,
+    }
+}
+
+fn tool_result_to_search_result(result: crate::tools::ToolResult) -> SearchResult {
+    let action = match result.action {
+        ToolAction::Enter { .. } => ActionKind::RunCommand,
+        ToolAction::Copy { .. } => ActionKind::CopyText,
+    };
+    let score = tool_result_score(&result.id);
+
+    SearchResult {
+        id: result.id,
+        title: result.title,
+        subtitle: result.subtitle,
+        kind: ResultKind::Tool,
+        action,
+        source: "工具".into(),
+        score,
+        shortcut: Some("Enter".into()),
+        file_metadata: None,
+        icon_path: None,
+    }
+}
+
+fn tool_result_score(id: &str) -> f32 {
+    match id {
+        "tool-entry:enc" => 0.96,
+        "tool-entry:dec" => 0.95,
+        "tool-entry:pwd" => 0.94,
+        "tool-entry:time" => 0.93,
+        _ => 0.92,
+    }
 }
 
 fn calculator_result(query: &str) -> Option<SearchResult> {
@@ -3126,6 +3531,385 @@ mod tests {
 
         assert_eq!(results.results.len(), 1);
         assert_eq!(results.results[0].id, "command:code");
+    }
+
+    fn quick_entry_test_context<'a>(
+        commands: &'a [CustomCommand],
+        phrases: &'a [Phrase],
+        templates: &'a [WebSearchTemplate],
+        password_options: &'a PasswordOptions,
+        enabled_sources: &'a HashSet<SearchSource>,
+    ) -> SearchContext<'a> {
+        SearchContext {
+            recent_scores: None,
+            query_selection_scores: None,
+            pinned_scores: None,
+            result_aliases: None,
+            custom_commands: Some(commands),
+            phrases: Some(phrases),
+            web_search_templates: Some(templates),
+            password_options: Some(password_options),
+            exclusion_rules: None,
+            source_weights: None,
+            enabled_sources,
+            everything_options: None,
+        }
+    }
+
+    fn test_custom_command(
+        id: &str,
+        name: &str,
+        command_type: &str,
+        target: &str,
+    ) -> CustomCommand {
+        CustomCommand {
+            id: id.into(),
+            name: name.into(),
+            command_type: command_type.into(),
+            target: target.into(),
+            created_at: "2026-06-01T00:00:00.000Z".into(),
+            updated_at: "2026-06-01T00:00:00.000Z".into(),
+        }
+    }
+
+    fn test_phrase(id: &str, title: &str, text: &str) -> Phrase {
+        Phrase {
+            id: id.into(),
+            title: title.into(),
+            text: text.into(),
+            created_at: "2026-06-01T00:00:00.000Z".into(),
+            updated_at: "2026-06-01T00:00:00.000Z".into(),
+            use_count: 0,
+        }
+    }
+
+    fn test_web_template(id: &str, keyword: &str, name: &str) -> WebSearchTemplate {
+        WebSearchTemplate {
+            id: id.into(),
+            keyword: keyword.into(),
+            name: name.into(),
+            url_template: format!("https://example.com/{keyword}?q={{query}}"),
+            created_at: "2026-06-01T00:00:00.000Z".into(),
+            updated_at: "2026-06-01T00:00:00.000Z".into(),
+        }
+    }
+
+    fn test_recent_item(
+        id: &str,
+        kind: &str,
+        title: &str,
+        target: &str,
+        use_count: i64,
+    ) -> RecentItem {
+        RecentItem {
+            id: id.into(),
+            kind: kind.into(),
+            title: title.into(),
+            target: target.into(),
+            use_count,
+            last_used_at: "2026-06-01T00:00:00.000Z".into(),
+        }
+    }
+
+    #[test]
+    fn quick_entry_alias_returns_category_entries() {
+        let enabled_sources = HashSet::from([
+            SearchSource::System,
+            SearchSource::Phrase,
+            SearchSource::WebSearch,
+            SearchSource::Tools,
+            SearchSource::Apps,
+            SearchSource::Files,
+        ]);
+        let password_options = PasswordOptions::default();
+        let context = quick_entry_test_context(&[], &[], &[], &password_options, &enabled_sources);
+        let route = parse_quick_entry_query("/", "/").expect("quick entry route");
+        let results = quick_entry_results(&route, &context);
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "quick-entry-category:cmd",
+                "quick-entry-category:phrase",
+                "quick-entry-category:web",
+                "quick-entry-category:tools",
+                "quick-entry-category:recent-apps",
+                "quick-entry-category:recent-folders",
+            ]
+        );
+    }
+
+    #[test]
+    fn quick_entry_alias_can_change_without_keeping_slash_active() {
+        assert!(parse_quick_entry_query("/", ">").is_none());
+        assert_eq!(
+            parse_quick_entry_query(">", ">"),
+            Some(QuickEntryRoute::Categories {
+                filter: String::new()
+            })
+        );
+        assert_eq!(
+            parse_quick_entry_query(">cmd", ">"),
+            Some(QuickEntryRoute::Category {
+                category: QuickEntryCategory::Cmd,
+                query: String::new()
+            })
+        );
+    }
+
+    #[test]
+    fn quick_entry_unknown_child_filters_categories_without_plain_search_fallback() {
+        let enabled_sources = HashSet::from([SearchSource::Tools]);
+        let password_options = PasswordOptions::default();
+        let context = quick_entry_test_context(&[], &[], &[], &password_options, &enabled_sources);
+        let route = parse_quick_entry_query("/to", "/").expect("quick entry filter route");
+        let results = quick_entry_results(&route, &context);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "quick-entry-category:tools");
+        assert!(parse_quick_entry_query("cmd", "/").is_none());
+        assert!(parse_quick_entry_query("web", "/").is_none());
+        assert!(parse_quick_entry_query("tools", "/").is_none());
+    }
+
+    #[test]
+    fn quick_entry_cmd_lists_and_filters_only_custom_commands() {
+        let commands = vec![
+            test_custom_command(
+                "custom-command:docs",
+                "Docs",
+                "url",
+                "https://example.com/docs",
+            ),
+            test_custom_command(
+                "custom-command:build",
+                "Build",
+                "program",
+                r"C:\Tools\build.exe",
+            ),
+        ];
+        let enabled_sources = HashSet::from([SearchSource::System]);
+        let password_options = PasswordOptions::default();
+        let context =
+            quick_entry_test_context(&commands, &[], &[], &password_options, &enabled_sources);
+
+        let all_route = parse_quick_entry_query("/cmd", "/").expect("cmd route");
+        let all_results = quick_entry_results(&all_route, &context);
+        assert_eq!(all_results.len(), 2);
+        assert!(all_results
+            .iter()
+            .all(|result| result.id.starts_with("custom-command:")));
+        assert!(all_results
+            .iter()
+            .all(|result| !result.id.starts_with("command-")));
+
+        let filtered_route = parse_quick_entry_query("/cmd program", "/").expect("filtered cmd");
+        let filtered_results = quick_entry_results(&filtered_route, &context);
+        assert_eq!(filtered_results.len(), 1);
+        assert_eq!(filtered_results[0].id, "custom-command:build");
+    }
+
+    #[test]
+    fn quick_entry_phrase_empty_query_lists_phrases() {
+        let phrases = vec![
+            test_phrase("phrase:greeting", "Greeting", "Hello"),
+            test_phrase("phrase:bye", "Bye", "Goodbye"),
+        ];
+        let enabled_sources = HashSet::from([SearchSource::Phrase]);
+        let password_options = PasswordOptions::default();
+        let context =
+            quick_entry_test_context(&[], &phrases, &[], &password_options, &enabled_sources);
+        let route = parse_quick_entry_query("/phrase", "/").expect("phrase route");
+        let results = quick_entry_results(&route, &context);
+
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|result| result.id.starts_with("phrase:")));
+    }
+
+    #[test]
+    fn quick_entry_web_empty_query_lists_templates_without_searching_default() {
+        let templates = vec![
+            test_web_template("web-template:gh", "gh", "GitHub"),
+            test_web_template("web-template:bing", "bing", "Bing"),
+        ];
+        let enabled_sources = HashSet::from([SearchSource::WebSearch]);
+        let password_options = PasswordOptions::default();
+        let context =
+            quick_entry_test_context(&[], &[], &templates, &password_options, &enabled_sources);
+        let route = parse_quick_entry_query("/web", "/").expect("web route");
+        let results = quick_entry_results(&route, &context);
+
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|result| result.id.starts_with("quick-entry-web-template:")));
+        assert!(results
+            .iter()
+            .all(|result| matches!(result.action, ActionKind::RunCommand)));
+    }
+
+    #[test]
+    fn quick_entry_web_keyword_query_uses_matching_template() {
+        let templates = vec![test_web_template("web-template:gh", "gh", "GitHub")];
+        let enabled_sources = HashSet::from([SearchSource::WebSearch]);
+        let password_options = PasswordOptions::default();
+        let context =
+            quick_entry_test_context(&[], &[], &templates, &password_options, &enabled_sources);
+        let route = parse_quick_entry_query("/web gh rust tauri", "/").expect("web search route");
+        let results = quick_entry_results(&route, &context);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action, ActionKind::OpenUrl);
+        assert_eq!(results[0].subtitle, "https://example.com/gh?q=rust%20tauri");
+    }
+
+    #[test]
+    fn quick_entry_web_keyword_can_be_named_web() {
+        let templates = vec![test_web_template("web-template:web", "web", "Default Web")];
+        let enabled_sources = HashSet::from([SearchSource::WebSearch]);
+        let password_options = PasswordOptions::default();
+        let context =
+            quick_entry_test_context(&[], &[], &templates, &password_options, &enabled_sources);
+        let route = parse_quick_entry_query("/web web asd", "/").expect("web search route");
+        let results = quick_entry_results(&route, &context);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action, ActionKind::OpenUrl);
+        assert_eq!(results[0].subtitle, "https://example.com/web?q=asd");
+    }
+
+    #[test]
+    fn quick_entry_tools_lists_tools_and_enters_individual_tool() {
+        let enabled_sources = HashSet::from([SearchSource::Tools]);
+        let password_options = PasswordOptions::default();
+        let context = quick_entry_test_context(&[], &[], &[], &password_options, &enabled_sources);
+        assert!(ToolProvider.search("/", &context).is_empty());
+
+        let menu_route = parse_quick_entry_query("/tools", "/").expect("tools route");
+        let menu_results = quick_entry_results(&menu_route, &context);
+        assert_eq!(
+            menu_results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "tool-entry:enc",
+                "tool-entry:dec",
+                "tool-entry:pwd",
+                "tool-entry:time"
+            ]
+        );
+
+        let enc_route = parse_quick_entry_query("/tools enc", "/").expect("tool hint route");
+        let enc_results = quick_entry_results(&enc_route, &context);
+        assert_eq!(enc_results.len(), 1);
+        assert_eq!(enc_results[0].id, "tool-hint:enc");
+    }
+
+    #[test]
+    fn quick_entry_recent_apps_lists_limited_exe_and_shortcut_results() {
+        let recent_items = (0..10)
+            .map(|index| {
+                test_recent_item(
+                    &format!("app:app-{index}"),
+                    "app",
+                    &format!("App {index}"),
+                    &format!(r"C:\Apps\App{index}.exe"),
+                    1,
+                )
+            })
+            .chain([
+                test_recent_item(
+                    "app:shortcut",
+                    "app",
+                    "Shortcut",
+                    r"C:\Apps\Shortcut.lnk",
+                    1,
+                ),
+                test_recent_item("app:url", "app", "Web Shortcut", r"C:\Apps\Web.url", 1),
+                test_recent_item("file:folder", "file", "Folder", r"C:\Apps", 1),
+            ])
+            .collect::<Vec<_>>();
+        let enabled_sources = HashSet::from([SearchSource::Apps]);
+        let password_options = PasswordOptions::default();
+        let context = quick_entry_test_context(&[], &[], &[], &password_options, &enabled_sources);
+
+        let route = parse_quick_entry_query("/recent-apps", "/").expect("recent apps route");
+        let results = quick_entry_results_with_recents(&route, &context, &recent_items);
+        assert_eq!(results.len(), MAX_QUICK_ENTRY_RECENT_RESULTS);
+        assert!(results
+            .iter()
+            .all(|result| matches!(&result.kind, ResultKind::App)));
+        assert!(results
+            .iter()
+            .all(|result| matches!(result.action, ActionKind::LaunchApp)));
+        assert!(results.iter().all(|result| !result.id.eq("app:url")));
+
+        let filtered_route =
+            parse_quick_entry_query("/recent-apps app 2", "/").expect("recent apps filter");
+        let filtered_results =
+            quick_entry_results_with_recents(&filtered_route, &context, &recent_items);
+        assert_eq!(filtered_results.len(), 1);
+        assert_eq!(filtered_results[0].id, "app:app-2");
+    }
+
+    #[test]
+    fn quick_entry_recent_folders_lists_only_existing_directories() {
+        let root = env::temp_dir().join(format!(
+            "easy-launcher-recent-folders-{}",
+            std::process::id()
+        ));
+        let folder = root.join("Project Folder");
+        let file = root.join("notes.txt");
+        fs::create_dir_all(&folder).expect("create temp folder");
+        fs::write(&file, "notes").expect("write temp file");
+
+        let recent_items = vec![
+            test_recent_item(
+                "file:folder",
+                "file",
+                "Project Folder",
+                folder.to_str().expect("folder utf-8"),
+                3,
+            ),
+            test_recent_item(
+                "file:notes",
+                "file",
+                "notes.txt",
+                file.to_str().expect("file utf-8"),
+                2,
+            ),
+            test_recent_item("app:code", "app", "Code", r"C:\Apps\Code.exe", 1),
+        ];
+        let enabled_sources = HashSet::from([SearchSource::Files]);
+        let password_options = PasswordOptions::default();
+        let context = quick_entry_test_context(&[], &[], &[], &password_options, &enabled_sources);
+
+        let route = parse_quick_entry_query("/recent-folders", "/").expect("recent folders route");
+        let results = quick_entry_results_with_recents(&route, &context, &recent_items);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "file:folder");
+        assert!(matches!(&results[0].kind, ResultKind::File));
+        assert_eq!(results[0].action, ActionKind::OpenFile);
+        assert!(results[0]
+            .file_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_dir));
+
+        let filtered_route =
+            parse_quick_entry_query("/recent-folders project", "/").expect("recent folders filter");
+        let filtered_results =
+            quick_entry_results_with_recents(&filtered_route, &context, &recent_items);
+        assert_eq!(filtered_results.len(), 1);
+        assert_eq!(filtered_results[0].id, "file:folder");
+
+        let _ = fs::remove_file(file);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

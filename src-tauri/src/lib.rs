@@ -25,14 +25,15 @@ use everything::{detect_everything_status, EverythingStatus};
 use process::hidden_command;
 use search::{
     apply_action_keyword_route, cached_search_diagnostics, default_search_core,
-    log_search_diagnostics, merge_ranked_results, parse_action_keyword_query, ActionKind,
+    log_search_diagnostics, merge_ranked_results, parse_action_keyword_query,
+    parse_quick_entry_query, quick_entry_results, quick_entry_results_with_recents, ActionKind,
     CachedSearchResults, EverythingSearchOptions, ProviderTier, SearchContext, SearchDiagnostics,
     SearchResult, SearchResultCache, SearchSource,
 };
 use selection::{capture_selected_text, SelectionCaptureResult};
 use selection_trigger::{SelectionTriggerHandle, SELECTION_TRIGGER_MODE_CTRL_MOUSE};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,6 +79,7 @@ const TRAY_MENU_EXIT: &str = "tray-exit";
 const STARTUP_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_VALUE_NAME: &str = "EasyLauncher";
 const SEARCH_RESULT_LIMIT: usize = 20;
+const QUICK_ENTRY_RECENT_STORAGE_LIMIT: usize = 50;
 const SEARCH_CACHE_MAX_ENTRIES: usize = 64;
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(45);
 const SEARCH_WINDOW_WIDTH: u32 = 728;
@@ -91,6 +93,10 @@ const SELECTION_PICKER_WINDOW_HEIGHT: u32 = 48;
 const SELECTION_RESULT_WINDOW_WIDTH: u32 = 520;
 const SELECTION_RESULT_WINDOW_HEIGHT: u32 = 420;
 const DEFAULT_TOOL_MENU_ALIAS: &str = "/";
+const DEFAULT_SLASH_BOARD_SCOPE_SETTINGS: &str = r#"[{"id":"all","visible":true},{"id":"run","visible":true},{"id":"text","visible":true},{"id":"web","visible":true},{"id":"tools","visible":true},{"id":"recent","visible":true},{"id":"open","visible":true},{"id":"system","visible":true}]"#;
+const SLASH_BOARD_SCOPE_IDS: [&str; 8] = [
+    "all", "run", "text", "web", "tools", "recent", "open", "system",
+];
 const EXPORTABLE_SETTING_KEYS: &[&str] = &[
     "launcher.shortcut",
     "launcher.double_alt.enabled",
@@ -121,6 +127,7 @@ const EXPORTABLE_SETTING_KEYS: &[&str] = &[
     "everything.search.full_path",
     "everything.search.content",
     "tools.menu.alias",
+    "slash.board.scopes",
     "tools.password.length",
     "tools.password.uppercase",
     "tools.password.lowercase",
@@ -445,11 +452,11 @@ fn set_setting(
     value: String,
     storage: tauri::State<'_, StorageState>,
 ) -> Result<(), String> {
-    validate_setting_value(&key, &value)?;
+    let normalized_value = normalize_setting_value(&key, &value)?;
     storage
         .lock()
         .map_err(|_| "无法写入设置".to_string())?
-        .set_setting(&key, &value)
+        .set_setting(&key, &normalized_value)
         .map_err(|error| error.to_string())
 }
 
@@ -899,14 +906,14 @@ fn import_config(
             if key == "launcher.shortcut" {
                 continue;
             }
-            validate_import_setting(&key, &value)?;
+            let normalized_value = validate_import_setting(&key, &value)?;
             if key == "startup.enabled" {
-                apply_startup_enabled(&app, &storage, value.trim() == "true")?;
+                apply_startup_enabled(&app, &storage, normalized_value.trim() == "true")?;
                 imported_count += 1;
                 continue;
             }
             storage
-                .set_setting(&key, value.trim())
+                .set_setting(&key, &normalized_value)
                 .map_err(|error| error.to_string())?;
             imported_count += 1;
         } else {
@@ -1970,26 +1977,37 @@ fn set_everything_search_options(
 
 #[tauri::command]
 fn search(query: String) -> Vec<SearchResult> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+
     let enabled_sources = default_enabled_sources();
     let route = parse_action_keyword_query(&query);
     let enabled_sources = apply_action_keyword_route(&enabled_sources, &route);
     let password_options = PasswordOptions::default();
+    let context = SearchContext {
+        recent_scores: None,
+        query_selection_scores: None,
+        pinned_scores: None,
+        result_aliases: None,
+        custom_commands: None,
+        phrases: None,
+        web_search_templates: None,
+        password_options: Some(&password_options),
+        exclusion_rules: None,
+        source_weights: None,
+        enabled_sources: &enabled_sources,
+        everything_options: None,
+    };
+    if let Some(quick_entry_route) = parse_quick_entry_query(&query, DEFAULT_TOOL_MENU_ALIAS) {
+        let mut results = quick_entry_results(&quick_entry_route, &context);
+        icons::attach_cached_icons(&mut results);
+        return results;
+    }
+
     let execution = default_search_core().search_with_diagnostics(
         &route.query,
-        &SearchContext {
-            recent_scores: None,
-            query_selection_scores: None,
-            pinned_scores: None,
-            result_aliases: None,
-            custom_commands: None,
-            phrases: None,
-            web_search_templates: None,
-            password_options: Some(&password_options),
-            exclusion_rules: None,
-            source_weights: None,
-            enabled_sources: &enabled_sources,
-            everything_options: None,
-        },
+        &context,
         SEARCH_RESULT_LIMIT,
         false,
     );
@@ -2038,6 +2056,9 @@ fn search_with_recents_blocking(
     if !is_current_search_request(&search_requests, request_id) {
         return Ok(Vec::new());
     }
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
 
     let route = parse_action_keyword_query(&query);
     let mut routed_query = route.query.clone();
@@ -2054,6 +2075,7 @@ fn search_with_recents_blocking(
         custom_commands,
         phrases,
         web_search_templates,
+        recent_items,
         exclusion_rules,
     ) = {
         let storage = storage.lock().map_err(|_| "无法读取搜索数据".to_string())?;
@@ -2102,6 +2124,9 @@ fn search_with_recents_blocking(
         } else {
             Vec::new()
         };
+        let recent_items = storage
+            .list_recent_items(QUICK_ENTRY_RECENT_STORAGE_LIMIT)
+            .map_err(|error| error.to_string())?;
         let exclusion_rules = storage
             .list_exclusion_rules()
             .map_err(|error| error.to_string())?;
@@ -2119,6 +2144,7 @@ fn search_with_recents_blocking(
             custom_commands,
             phrases,
             web_search_templates,
+            recent_items,
             exclusion_rules,
         )
     };
@@ -2132,6 +2158,35 @@ fn search_with_recents_blocking(
         &route,
     );
     let source_weights = source_weights_from_settings(&search_weight_settings);
+    if let Some(quick_entry_route) = parse_quick_entry_query(&query, &tool_menu_alias) {
+        let results = quick_entry_results_with_recents(
+            &quick_entry_route,
+            &SearchContext {
+                recent_scores: Some(&recent_scores),
+                query_selection_scores: Some(&query_selection_scores),
+                pinned_scores: Some(&pinned_scores),
+                result_aliases: Some(&result_aliases),
+                custom_commands: Some(&custom_commands),
+                phrases: Some(&phrases),
+                web_search_templates: Some(&web_search_templates),
+                password_options: Some(&password_options),
+                exclusion_rules: Some(&exclusion_rules),
+                source_weights: Some(&source_weights),
+                enabled_sources: &enabled_sources,
+                everything_options: Some(&everything_options),
+            },
+            &recent_items,
+        )
+        .into_iter()
+        .take(SEARCH_RESULT_LIMIT)
+        .collect::<Vec<_>>();
+        let diagnostics = cached_search_diagnostics(&query, results.len(), "quick-entry");
+        log_search_diagnostics(&diagnostics);
+        let results =
+            finalize_search_results(results, Some(app), request_id, Some(search_requests));
+        return Ok(results);
+    }
+
     routed_query = normalize_tool_menu_query(&routed_query, &tool_menu_alias);
     let bypass_cache = is_tool_query(&routed_query);
     let cache_key = search_cache_key(
@@ -2718,19 +2773,11 @@ fn is_current_search_request(search_requests: &SearchRequestTracker, request_id:
     request_id == 0 || search_requests.load(Ordering::Relaxed) == request_id
 }
 
-fn normalize_tool_menu_query(query: &str, menu_alias: &str) -> String {
-    if query.trim() == menu_alias.trim() {
-        DEFAULT_TOOL_MENU_ALIAS.into()
-    } else {
-        query.to_string()
-    }
+fn normalize_tool_menu_query(query: &str, _menu_alias: &str) -> String {
+    query.to_string()
 }
 
 fn is_tool_query(query: &str) -> bool {
-    if query.trim() == DEFAULT_TOOL_MENU_ALIAS {
-        return true;
-    }
-
     matches!(
         query
             .split_whitespace()
@@ -3514,8 +3561,24 @@ fn apply_named_shortcut(
     }
 }
 
-fn validate_import_setting(key: &str, value: &str) -> Result<(), String> {
-    validate_setting_value(key, value)
+fn validate_import_setting(key: &str, value: &str) -> Result<String, String> {
+    normalize_setting_value(key, value).map(|value| {
+        if key == "slash.board.scopes" {
+            value
+        } else {
+            value.trim().to_string()
+        }
+    })
+}
+
+fn normalize_setting_value(key: &str, value: &str) -> Result<String, String> {
+    match key {
+        "slash.board.scopes" => Ok(normalize_slash_board_scope_settings(value)),
+        _ => {
+            validate_setting_value(key, value)?;
+            Ok(value.to_string())
+        }
+    }
 }
 
 fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
@@ -3576,6 +3639,10 @@ fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
         | "search.weight.web_search"
         | "search.weight.tools" => parse_weight(value).map(|_| ()),
         "tools.menu.alias" => validate_tool_menu_alias(value),
+        "slash.board.scopes" => {
+            let _ = normalize_slash_board_scope_settings(value);
+            Ok(())
+        }
         "tools.password.length" => parse_password_length(value).map(|_| ()),
         "updates.check.interval_hours" => parse_update_interval_hours(value).map(|_| ()),
         "updates.check.last_checked_at"
@@ -3899,18 +3966,67 @@ fn sanitize_weight(value: f32) -> f32 {
 fn validate_tool_menu_alias(value: &str) -> Result<(), String> {
     let alias = value.trim();
     if alias.is_empty() {
-        return Err("工具总入口不能为空".into());
+        return Err("快捷入口不能为空".into());
     }
     if alias.chars().any(char::is_whitespace) {
-        return Err("工具总入口不能包含空格".into());
+        return Err("快捷入口不能包含空格".into());
     }
     if matches!(
         alias.to_ascii_lowercase().as_str(),
         "tools" | "enc" | "dec" | "pwd" | "time" | "="
     ) {
-        return Err("工具总入口不能使用已有快捷指令".into());
+        return Err("快捷入口不能使用已有快捷指令".into());
     }
     Ok(())
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlashBoardScopeSetting {
+    id: String,
+    #[serde(default = "default_true")]
+    visible: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn normalize_slash_board_scope_settings(value: &str) -> String {
+    let Ok(settings) = serde_json::from_str::<Vec<SlashBoardScopeSetting>>(value.trim()) else {
+        return DEFAULT_SLASH_BOARD_SCOPE_SETTINGS.into();
+    };
+
+    let known_ids = SLASH_BOARD_SCOPE_IDS
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut seen_ids = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for setting in settings {
+        if !known_ids.contains(setting.id.as_str()) || !seen_ids.insert(setting.id.clone()) {
+            continue;
+        }
+        normalized.push(SlashBoardScopeSetting {
+            id: setting.id,
+            visible: setting.visible,
+        });
+    }
+
+    for id in SLASH_BOARD_SCOPE_IDS {
+        if seen_ids.insert(id.to_string()) {
+            normalized.push(SlashBoardScopeSetting {
+                id: id.into(),
+                visible: true,
+            });
+        }
+    }
+
+    if normalized.iter().all(|setting| !setting.visible) {
+        return DEFAULT_SLASH_BOARD_SCOPE_SETTINGS.into();
+    }
+
+    serde_json::to_string(&normalized).unwrap_or_else(|_| DEFAULT_SLASH_BOARD_SCOPE_SETTINGS.into())
 }
 
 fn parse_password_length(value: &str) -> Result<usize, String> {
@@ -4725,6 +4841,54 @@ mod tests {
         assert!(validate_import_setting("file.editor.path", "").is_ok());
         assert!(validate_import_setting("folder.editor.path", ".").is_ok());
         assert!(validate_import_setting("file.editor.path", "Z:\\missing\\editor.exe").is_err());
+    }
+
+    #[test]
+    fn slash_board_scope_settings_are_exportable_and_normalized() {
+        assert!(EXPORTABLE_SETTING_KEYS.contains(&"slash.board.scopes"));
+
+        let normalized = validate_import_setting(
+            "slash.board.scopes",
+            r#"[
+                {"id":"web","visible":false},
+                {"id":"unknown","visible":true},
+                {"id":"web","visible":true},
+                {"id":"all","visible":true}
+            ]"#,
+        )
+        .expect("normalize slash board settings");
+
+        assert!(
+            normalized.starts_with(r#"[{"id":"web","visible":false},{"id":"all","visible":true}"#)
+        );
+        assert!(normalized.contains(r#""id":"run""#));
+        assert!(!normalized.contains("unknown"));
+    }
+
+    #[test]
+    fn slash_board_scope_settings_fall_back_when_invalid_or_all_hidden() {
+        assert_eq!(
+            validate_import_setting("slash.board.scopes", "not-json").unwrap(),
+            DEFAULT_SLASH_BOARD_SCOPE_SETTINGS
+        );
+
+        assert_eq!(
+            validate_import_setting(
+                "slash.board.scopes",
+                r#"[
+                    {"id":"all","visible":false},
+                    {"id":"run","visible":false},
+                    {"id":"text","visible":false},
+                    {"id":"web","visible":false},
+                    {"id":"tools","visible":false},
+                    {"id":"recent","visible":false},
+                    {"id":"open","visible":false},
+                    {"id":"system","visible":false}
+                ]"#,
+            )
+            .unwrap(),
+            DEFAULT_SLASH_BOARD_SCOPE_SETTINGS
+        );
     }
 
     #[test]

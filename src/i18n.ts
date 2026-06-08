@@ -40,6 +40,13 @@ const exactText: Record<string, string> = {
   "打开 Easy Launcher 设置": "Open Easy Launcher settings",
   "搜索，输入 option 打开设置": "Search, type option to open settings",
   "筛选操作：": "Filter actions:",
+  "Slash Board 范围": "Slash Board scopes",
+  "综合": "Overview",
+  "文本": "Text",
+  "最近打开": "Recent",
+  "常用打开": "Open",
+  "没有内容": "No content",
+  "Slash Board 加载失败": "Slash Board failed to load",
   "设置分组": "Settings sections",
   "设置操作区": "Settings content",
   "搜索设置": "Search Settings",
@@ -116,11 +123,11 @@ const exactText: Record<string, string> = {
   "目录": "Folder",
   "保存": "Save",
   "工具设置": "Tool Settings",
-  "输入总入口查看工具菜单；输入 enc、dec、pwd 或 time 进入单个工具":
-    "Type the menu alias to show tools. Type enc, dec, pwd, or time to open a specific tool.",
+  "输入快捷入口查看分类；输入 enc、dec、pwd 或 time 进入单个工具":
+    "Type the quick entry alias to show categories. Type enc, dec, pwd, or time to open a specific tool.",
   "入口": "Entry",
-  "严格匹配时展示工具清单；选择条目后进入对应快捷指令。":
-    "shows the tool list only on an exact match. Select an item to enter that command.",
+  "打开快捷入口；选择 tools 后进入工具清单。":
+    "opens quick entry. Select tools to show the tool list.",
   "转换": "Conversion",
   "返回编码和摘要；": "returns encodings and summaries.",
   "返回解码、HTML 实体和 URL 参数 JSON 解析。":
@@ -128,10 +135,14 @@ const exactText: Record<string, string> = {
   "其他": "Other",
   "按下方默认策略生成密码；": "generates a password using the default policy below.",
   "自动识别时间戳或日期时间。": "auto-detects timestamps or date/time values.",
-  "工具总入口": "Tool Menu Alias",
-  "默认 /；保存后只有完整输入该 alias 才显示工具菜单":
-    "Default is /. After saving, the tool menu appears only when the alias is typed exactly.",
-  "工具总入口 Alias": "Tool menu alias",
+  "快捷入口 Alias": "Quick Entry Alias",
+  "默认 /；保存后输入该 alias 会显示命令、短语、网页搜索、工具和最近打开分类":
+    "Default is /. After saving, typing this alias shows commands, phrases, web search, tools, and recent-opened categories.",
+  "快捷入口保存失败": "Failed to save quick entry alias",
+  "快捷入口不能为空": "Quick entry alias cannot be empty",
+  "快捷入口不能包含空格": "Quick entry alias cannot contain spaces",
+  "快捷入口不能使用已有快捷指令": "Quick entry alias cannot use an existing shortcut command",
+  "Alias 与快捷入口冲突": "Alias conflicts with the quick entry alias",
   "不能包含空格，也不能使用 enc、dec、pwd、time 或 tools，避免和搜索词或短指令冲突。":
     "Cannot contain spaces or use enc, dec, pwd, time, or tools, to avoid conflicts with search terms and short commands.",
   "随机密码默认值": "Random Password Defaults",
@@ -413,7 +424,7 @@ const replacements: Array<[RegExp, string]> = [
   [/^Everything 搜索选项已保存$/, "Everything search options saved"],
   [/^Everything 设置路径：工具 > 选项 > HTTP 服务器$/, "Everything path: Tools > Options > HTTP Server"],
   [/^已打开 Everything 下载页$/, "Opened Everything download page"],
-  [/^工具总入口已保存：(.+)$/, "Tool menu alias saved: $1"],
+  [/^快捷入口已保存：(.+)$/, "Quick entry alias saved: $1"],
   [/^(.+) 个供应商$/, "$1 providers"],
   [/^(.+) 个启用模型$/, "$1 enabled models"],
   [/^已获取 (\d+) 个模型，请勾选需要启用的模型$/, "Fetched $1 models. Check the models you want to enable."],

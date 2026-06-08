@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
   ReactNode,
 } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
@@ -96,6 +97,11 @@ type SelectionTriggerMode = "ctrl_mouse";
 type ViewMode = "launcher" | "ai";
 type AiSettingsTab = "providers" | "assistants";
 type LanguageOption = LanguagePreference;
+type SlashBoardScope = "all" | "run" | "text" | "web" | "tools" | "recent" | "open" | "system";
+type SlashBoardScopeSetting = {
+  id: SlashBoardScope;
+  visible: boolean;
+};
 
 type AiModelProfile = {
   id: string;
@@ -508,6 +514,8 @@ const SETTINGS_WINDOW_WIDTH = 960;
 const SETTINGS_WINDOW_HEIGHT = 700;
 const AI_WINDOW_WIDTH = 1040;
 const AI_WINDOW_HEIGHT = 680;
+const SLASH_BOARD_WINDOW_MAX_HEIGHT = 420;
+const SLASH_BOARD_RESULT_LIMIT = 8;
 const SELECTION_PICKER_WINDOW_WIDTH = 520;
 const SELECTION_PICKER_WINDOW_HEIGHT = 48;
 const SELECTION_RESULT_WINDOW_WIDTH = 520;
@@ -539,6 +547,21 @@ const settingsSections: { id: SettingsSection; label: string; meta: string }[] =
   { id: "backup", label: "配置", meta: "导入导出" },
 ];
 
+const slashBoardScopes: { id: SlashBoardScope; label: string; title: string; subtitle: string }[] = [
+  { id: "all", label: "All", title: "All", subtitle: "综合" },
+  { id: "run", label: "Run", title: "Run", subtitle: "命令" },
+  { id: "text", label: "Text", title: "Text", subtitle: "文本" },
+  { id: "web", label: "Web", title: "Web", subtitle: "网页" },
+  { id: "tools", label: "Tools", title: "Tools", subtitle: "工具" },
+  { id: "recent", label: "Recent", title: "Recent", subtitle: "最近打开" },
+  { id: "open", label: "Open", title: "Open", subtitle: "常用打开" },
+  { id: "system", label: "System", title: "System", subtitle: "系统" },
+];
+const defaultSlashBoardScopeSettings: SlashBoardScopeSetting[] = slashBoardScopes.map((scope) => ({
+  id: scope.id,
+  visible: true,
+}));
+
 function App() {
   return getCurrentWindow().label === "selection" ? <SelectionAssistantApp /> : <MainApp />;
 }
@@ -549,6 +572,13 @@ function MainApp() {
   const [resultsRevision, setResultsRevision] = useState(0);
   const resultIconPathsRef = useRef<Map<string, string>>(new Map());
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [slashBoardScope, setSlashBoardScope] = useState<SlashBoardScope>("all");
+  const [slashBoardScopeSettings, setSlashBoardScopeSettings] =
+    useState<SlashBoardScopeSetting[]>(defaultSlashBoardScopeSettings);
+  const [draggedSlashBoardScope, setDraggedSlashBoardScope] =
+    useState<SlashBoardScope | null>(null);
+  const [slashBoardResults, setSlashBoardResults] = useState<SearchResult[]>([]);
+  const [slashBoardRevision, setSlashBoardRevision] = useState(0);
   const [backendMessage, setBackendMessage] = useState("后端未验证");
   const [shortcutStatus, setShortcutStatus] = useState<ShortcutStatus>({
     shortcut: "Alt+1",
@@ -652,7 +682,7 @@ function MainApp() {
       fullPath: false,
       searchContent: false,
     });
-  const [appVersion, setAppVersion] = useState("0.1.0");
+  const [appVersion, setAppVersion] = useState("0.2.0");
   const [includePrereleaseUpdates, setIncludePrereleaseUpdates] = useState(false);
   const [lastUpdateCheckAt, setLastUpdateCheckAt] = useState<string | null>(null);
   const [dismissedUpdateTag, setDismissedUpdateTag] = useState<string | null>(null);
@@ -724,6 +754,10 @@ function MainApp() {
   }, [contextSession]);
 
   const displayResults = useMemo(() => {
+    if (!contextSession && query.trim().length === 0) {
+      return [];
+    }
+
     const trimmed = query.trim().toLowerCase();
     const optionMatches =
       trimmed.length > 0 &&
@@ -759,6 +793,24 @@ function MainApp() {
     () => displayResults[Math.min(selectedIndex, Math.max(displayResults.length - 1, 0))],
     [displayResults, selectedIndex],
   );
+  const slashBoardActive =
+    viewMode === "launcher" &&
+    !showSettings &&
+    !contextSession &&
+    isSlashBoardAliasQuery(query, toolMenuAlias);
+  const visibleSlashBoardScopes = useMemo(
+    () => slashBoardScopesFromSettings(slashBoardScopeSettings),
+    [slashBoardScopeSettings],
+  );
+  const activeSlashBoardScope =
+    visibleSlashBoardScopes.find((scope) => scope.id === slashBoardScope) ??
+    visibleSlashBoardScopes[0] ??
+    slashBoardScopes[0];
+  const selectedSlashBoardResult = useMemo(
+    () => slashBoardResults[Math.min(selectedIndex, Math.max(slashBoardResults.length - 1, 0))],
+    [selectedIndex, slashBoardResults],
+  );
+  const visibleResultCount = slashBoardActive ? slashBoardResults.length : displayResults.length;
   const selectedAiAssistant =
     aiAssistants.find((assistant) => assistant.id === selectedAiAssistantId) ?? aiAssistants[0];
   const selectedAiConversation =
@@ -855,7 +907,13 @@ function MainApp() {
       ? SETTINGS_WINDOW_HEIGHT
       : viewMode === "ai"
         ? AI_WINDOW_HEIGHT
-        : Math.max(SEARCH_WINDOW_MIN_HEIGHT, Math.min(contentHeight, SEARCH_WINDOW_MAX_HEIGHT));
+        : Math.max(
+            SEARCH_WINDOW_MIN_HEIGHT,
+            Math.min(
+              contentHeight,
+              slashBoardActive ? SLASH_BOARD_WINDOW_MAX_HEIGHT : SEARCH_WINDOW_MAX_HEIGHT,
+            ),
+          );
 
     getCurrentWindow()
       .setSize(new LogicalSize(width, height))
@@ -868,6 +926,10 @@ function MainApp() {
     query,
     selectedIndex,
     showSettings,
+    slashBoardActive,
+    slashBoardResults.length,
+    slashBoardScope,
+    visibleSlashBoardScopes.length,
     viewMode,
   ]);
 
@@ -875,12 +937,15 @@ function MainApp() {
     if (viewMode !== "launcher" || showSettings) {
       return;
     }
+    if (visibleResultCount === 0) {
+      return;
+    }
 
     resultItemRefs.current[selectedIndex]?.scrollIntoView({
       block: "nearest",
       inline: "nearest",
     });
-  }, [selectedIndex, displayResults.length, showSettings, viewMode]);
+  }, [selectedIndex, visibleResultCount, showSettings, viewMode]);
 
   function showError(scope: ErrorScope, title: string, error?: unknown) {
     const message = errorMessage(error, title);
@@ -978,6 +1043,13 @@ function MainApp() {
     return isLatestSearchRequest(requestId) ? response : null;
   }
 
+  async function invokeSlashBoardSearch(searchQuery: string) {
+    return invoke<SearchResult[]>("search_with_recents", {
+      query: searchQuery,
+      requestId: 0,
+    });
+  }
+
   function setSearchResults(nextResults: SearchResult[]) {
     setResults((current) => {
       const resultIconPaths = resultIconPathsRef.current;
@@ -992,6 +1064,88 @@ function MainApp() {
     });
     setResultsRevision((current) => current + 1);
   }
+
+  useEffect(() => {
+    if (!slashBoardActive) {
+      setSlashBoardResults([]);
+      return;
+    }
+
+    setSlashBoardScope(visibleSlashBoardScopes[0]?.id ?? "all");
+    setSelectedIndex(0);
+  }, [slashBoardActive, toolMenuAlias, visibleSlashBoardScopes]);
+
+  useEffect(() => {
+    if (!slashBoardActive) {
+      return;
+    }
+    if (visibleSlashBoardScopes.some((scope) => scope.id === slashBoardScope)) {
+      return;
+    }
+    setSlashBoardScope(visibleSlashBoardScopes[0]?.id ?? "all");
+    setSelectedIndex(0);
+  }, [slashBoardActive, slashBoardScope, visibleSlashBoardScopes]);
+
+  useEffect(() => {
+    if (!slashBoardActive) {
+      return;
+    }
+
+    let cancelled = false;
+    const previewQueries = slashBoardPreviewQueries(slashBoardScope, toolMenuAlias);
+    const staticResults = slashBoardStaticResults(slashBoardScope);
+    setSelectedIndex(0);
+
+    async function loadSlashBoardResults() {
+      try {
+        const groups = await Promise.all(
+          previewQueries.map((previewQuery) =>
+            invokeSlashBoardSearch(previewQuery).catch(() => fallbackResults(previewQuery)),
+          ),
+        );
+        if (cancelled) {
+          return;
+        }
+
+        const nextResults = mergeSlashBoardResultGroups(
+          [staticResults, ...groups],
+          SLASH_BOARD_RESULT_LIMIT,
+        );
+        setSlashBoardResults(nextResults);
+        setSlashBoardRevision((current) => current + 1);
+        setActionMessage(nextResults.length > 0 ? "Slash Board" : "没有匹配结果");
+        clearError();
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setSlashBoardResults([]);
+        setSlashBoardRevision((current) => current + 1);
+        showError("搜索", "Slash Board 加载失败", error);
+      }
+    }
+
+    loadSlashBoardResults();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [slashBoardActive, slashBoardScope, toolMenuAlias]);
+
+  useEffect(() => {
+    if (!draggedSlashBoardScope) {
+      return;
+    }
+
+    const stopDragging = () => setDraggedSlashBoardScope(null);
+    window.addEventListener("pointerup", stopDragging);
+    window.addEventListener("blur", stopDragging);
+
+    return () => {
+      window.removeEventListener("pointerup", stopDragging);
+      window.removeEventListener("blur", stopDragging);
+    };
+  }, [draggedSlashBoardScope]);
 
   useEffect(() => {
     async function loadRuntimeStatus() {
@@ -1062,6 +1216,12 @@ function MainApp() {
           key: "tools.menu.alias",
         });
         setToolMenuAlias(loadedToolMenuAlias ?? "/");
+        const loadedSlashBoardScopeSettings = await invoke<string | null>("get_setting", {
+          key: "slash.board.scopes",
+        });
+        setSlashBoardScopeSettings(
+          normalizeSlashBoardScopeSettings(parseSlashBoardScopeSettings(loadedSlashBoardScopeSettings)),
+        );
         const loadedEverythingOptions = await invoke<EverythingSearchOptions>(
           "get_everything_search_options",
         );
@@ -1329,7 +1489,7 @@ function MainApp() {
   }, []);
 
   useEffect(() => {
-    if (contextSession) {
+    if (contextSession || slashBoardActive) {
       return;
     }
 
@@ -1363,7 +1523,7 @@ function MainApp() {
         latestSearchRequestId.current += 1;
       }
     };
-  }, [contextSession, query]);
+  }, [contextSession, query, slashBoardActive]);
 
   async function pingBackend() {
     try {
@@ -1379,9 +1539,9 @@ function MainApp() {
   async function loadUpdateSettings() {
     try {
       const version = await invoke<string>("get_app_version");
-      setAppVersion(version || "0.1.0");
+      setAppVersion(version || "0.2.0");
     } catch {
-      setAppVersion("0.1.0");
+      setAppVersion("0.2.0");
     }
 
     const includePrerelease = await invoke<string | null>("get_setting", {
@@ -2190,6 +2350,12 @@ function MainApp() {
       key: "tools.menu.alias",
     });
     setToolMenuAlias(loadedToolMenuAlias ?? "/");
+    const loadedSlashBoardScopeSettings = await invoke<string | null>("get_setting", {
+      key: "slash.board.scopes",
+    });
+    setSlashBoardScopeSettings(
+      normalizeSlashBoardScopeSettings(parseSlashBoardScopeSettings(loadedSlashBoardScopeSettings)),
+    );
     const loadedEverythingOptions = await invoke<EverythingSearchOptions>(
       "get_everything_search_options",
     );
@@ -2634,12 +2800,76 @@ function MainApp() {
       if (response !== null) {
         setSearchResults(response);
       }
-      setActionMessage(`工具总入口已保存：${nextAlias}`);
+      setActionMessage(`快捷入口已保存：${nextAlias}`);
       clearError();
     } catch (error) {
       setToolMenuAlias(previousAlias);
-      showError("配置", "工具总入口保存失败", error);
+      showError("配置", "快捷入口保存失败", error);
     }
+  }
+
+  async function saveSlashBoardScopeSettings(nextSettings: SlashBoardScopeSetting[]) {
+    const previousSettings = slashBoardScopeSettings;
+    const normalizedSettings = normalizeSlashBoardScopeSettings(nextSettings);
+    setSlashBoardScopeSettings(normalizedSettings);
+
+    try {
+      await invoke("set_setting", {
+        key: "slash.board.scopes",
+        value: JSON.stringify(normalizedSettings),
+      });
+      setActionMessage("Slash Board 菜单已保存");
+      clearError();
+    } catch (error) {
+      setSlashBoardScopeSettings(previousSettings);
+      showError("配置", "Slash Board 菜单保存失败", error);
+    }
+  }
+
+  function updateSlashBoardScopeVisibility(scopeId: SlashBoardScope, visible: boolean) {
+    const visibleCount = slashBoardScopeSettings.filter((setting) => setting.visible).length;
+    if (!visible && visibleCount <= 1) {
+      setActionMessage("Slash Board 至少保留一个范围");
+      return;
+    }
+
+    saveSlashBoardScopeSettings(
+      slashBoardScopeSettings.map((setting) =>
+        setting.id === scopeId ? { ...setting, visible } : setting,
+      ),
+    );
+  }
+
+  function reorderSlashBoardScope(sourceId: SlashBoardScope, targetId: SlashBoardScope) {
+    if (sourceId === targetId) {
+      return;
+    }
+
+    const sourceIndex = slashBoardScopeSettings.findIndex((setting) => setting.id === sourceId);
+    const targetIndex = slashBoardScopeSettings.findIndex((setting) => setting.id === targetId);
+    if (sourceIndex < 0 || targetIndex < 0) {
+      return;
+    }
+
+    const nextSettings = [...slashBoardScopeSettings];
+    const [sourceSetting] = nextSettings.splice(sourceIndex, 1);
+    nextSettings.splice(targetIndex, 0, sourceSetting);
+    saveSlashBoardScopeSettings(nextSettings);
+  }
+
+  function handleSlashBoardScopePointerDown(
+    event: ReactPointerEvent<HTMLElement>,
+    scopeId: SlashBoardScope,
+  ) {
+    event.preventDefault();
+    setDraggedSlashBoardScope(scopeId);
+  }
+
+  function handleSlashBoardScopePointerEnter(targetId: SlashBoardScope) {
+    if (!draggedSlashBoardScope || draggedSlashBoardScope === targetId) {
+      return;
+    }
+    reorderSlashBoardScope(draggedSlashBoardScope, targetId);
   }
 
   async function updateEverythingSearchOption(
@@ -2748,22 +2978,33 @@ function MainApp() {
       return;
     }
 
+    if (isQuickEntryCategoryResult(result)) {
+      const nextQuery = quickEntryCategoryQuery(result, toolMenuAlias);
+      if (!nextQuery) {
+        showError("系统", `无法进入入口：${result.title}`);
+        return;
+      }
+      await enterSearchQuery(nextQuery, `已进入：${result.title}`);
+      return;
+    }
+
+    if (isQuickEntryWebTemplateResult(result)) {
+      const nextQuery = webTemplateQueryFromResult(result, toolMenuAlias);
+      if (!nextQuery) {
+        showError("系统", `无法进入网页搜索模板：${result.title}`);
+        return;
+      }
+      await enterSearchQuery(nextQuery, `已选择网页搜索模板：${result.title}`);
+      return;
+    }
+
     if (result.id.startsWith("tool-entry:") || result.id.startsWith("tool-hint:")) {
-      const nextQuery = toolCommandFromResult(result);
+      const nextQuery = quickEntryToolQueryFromResult(result, toolMenuAlias);
       if (!nextQuery) {
         showError("系统", `无法进入工具：${result.title}`);
         return;
       }
-      setQuery(nextQuery);
-      setSelectedIndex(0);
-      setContextSession(null);
-      focusSearchInput();
-      setActionMessage(`已进入：${result.title}`);
-      const response = await invokeSearchWithRecents(nextQuery);
-      if (response !== null) {
-        setSearchResults(response);
-      }
-      clearError();
+      await enterSearchQuery(nextQuery, `已进入：${result.title}`);
       return;
     }
 
@@ -2787,6 +3028,19 @@ function MainApp() {
     } catch (error) {
       showError("系统", `执行失败：${result.title}`, error);
     }
+  }
+
+  async function enterSearchQuery(nextQuery: string, message: string) {
+    setQuery(nextQuery);
+    setSelectedIndex(0);
+    setContextSession(null);
+    focusSearchInput();
+    setActionMessage(message);
+    const response = await invokeSearchWithRecents(nextQuery);
+    if (response !== null) {
+      setSearchResults(response);
+    }
+    clearError();
   }
 
   async function openResultParent(result: SearchResult) {
@@ -3196,6 +3450,52 @@ function MainApp() {
   function handleSearchNavigationKeyDown(
     event: React.KeyboardEvent<HTMLInputElement | HTMLDivElement>,
   ) {
+    if (slashBoardActive) {
+      if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+        event.preventDefault();
+        setSlashBoardScope((current) =>
+          nextSlashBoardScope(
+            current,
+            event.key === "ArrowRight" ? 1 : -1,
+            visibleSlashBoardScopes,
+          ),
+        );
+        setSelectedIndex(0);
+        return;
+      }
+
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setSelectedIndex((current) =>
+          Math.min(current + 1, Math.max(slashBoardResults.length - 1, 0)),
+        );
+        return;
+      }
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setSelectedIndex((current) => Math.max(current - 1, 0));
+        return;
+      }
+
+      if (event.key === "Enter" && selectedSlashBoardResult) {
+        event.preventDefault();
+        if (event.shiftKey) {
+          openResultContextMenu(selectedSlashBoardResult);
+          return;
+        }
+        executeSelectedResult(selectedSlashBoardResult);
+        return;
+      }
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setQuery("");
+        setActionMessage("已清空");
+        return;
+      }
+    }
+
     if (contextSession) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -3292,7 +3592,9 @@ function MainApp() {
               ? "launcherPage aiPage"
               : contextSession
                 ? "launcherPage contextMode"
-                : "launcherPage"
+                : slashBoardActive
+                  ? "launcherPage slashBoardMode"
+                  : "launcherPage"
         }
         onMouseDown={startWindowDrag}
         aria-label="Easy Launcher"
@@ -3769,12 +4071,12 @@ function MainApp() {
                 <>
                   <div className="settingsHeader">
                     <strong>工具设置</strong>
-                    <small>输入总入口查看工具菜单；输入 enc、dec、pwd 或 time 进入单个工具</small>
+                    <small>输入快捷入口查看分类；输入 enc、dec、pwd 或 time 进入单个工具</small>
                   </div>
                   <div className="configGuide">
                     <span>
                       <strong>入口</strong>
-                      <code>{toolMenuAlias || "/"}</code> 严格匹配时展示工具清单；选择条目后进入对应快捷指令。
+                      <code>{toolMenuAlias || "/"}</code> 打开快捷入口；选择 tools 后进入工具清单。
                     </span>
                     <span>
                       <strong>转换</strong>
@@ -3789,13 +4091,15 @@ function MainApp() {
                   </div>
                   <div className="settingsSubsection">
                     <div className="settingsHeader compact">
-                      <strong>工具总入口</strong>
-                      <small>默认 /；保存后只有完整输入该 alias 才显示工具菜单</small>
+                      <strong>快捷入口 Alias</strong>
+                      <small>
+                        默认 /；保存后输入该 alias 会显示命令、短语、网页搜索、工具和最近打开分类
+                      </small>
                     </div>
                     <div className="settingRow shortcutRow">
                       <span className="settingLabel">Alias</span>
                       <input
-                        aria-label="工具总入口 Alias"
+                        aria-label="快捷入口 Alias"
                         value={toolMenuAlias}
                         onChange={(event) => setToolMenuAlias(event.target.value)}
                         placeholder="/"
@@ -3807,6 +4111,77 @@ function MainApp() {
                     <small className="settingsHint">
                       不能包含空格，也不能使用 enc、dec、pwd、time 或 tools，避免和搜索词或短指令冲突。
                     </small>
+                    <div className="slashBoardSettings" aria-label="Slash Board 菜单">
+                      <div className="slashBoardSettingsHeader">
+                        <strong>Slash Board 菜单</strong>
+                        <small>按住三横线拖拽排序，勾选控制显示</small>
+                      </div>
+                      <div className="slashBoardSettingsList">
+                        {slashBoardScopeSettings.map((setting, index) => {
+                          const scope = slashBoardScopes.find((item) => item.id === setting.id);
+                          if (!scope) {
+                            return null;
+                          }
+                          const visibleCount = slashBoardScopeSettings.filter(
+                            (item) => item.visible,
+                          ).length;
+                          const cannotHide = setting.visible && visibleCount <= 1;
+
+                          return (
+                            <div
+                              className={
+                                draggedSlashBoardScope === setting.id
+                                  ? "slashBoardSettingsItem dragging"
+                                  : "slashBoardSettingsItem"
+                              }
+                              key={setting.id}
+                              onPointerEnter={() =>
+                                handleSlashBoardScopePointerEnter(setting.id)
+                              }
+                              onPointerUp={() => setDraggedSlashBoardScope(null)}
+                            >
+                              <span className="slashBoardSettingsOrder">
+                                {String(index + 1).padStart(2, "0")}
+                              </span>
+                              <label>
+                                <input
+                                  type="checkbox"
+                                  checked={setting.visible}
+                                  disabled={cannotHide}
+                                  onChange={(event) =>
+                                    updateSlashBoardScopeVisibility(
+                                      setting.id,
+                                      event.target.checked,
+                                    )
+                                  }
+                                />
+                                <span>{scope.label}</span>
+                                <small>{scope.subtitle}</small>
+                              </label>
+                              <span
+                                className="slashBoardSettingsHandle"
+                                role="button"
+                                tabIndex={0}
+                                aria-label={`${scope.label} 拖拽排序`}
+                                onPointerDown={(event) =>
+                                  handleSlashBoardScopePointerDown(event, setting.id)
+                                }
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" || event.key === " ") {
+                                    event.preventDefault();
+                                    setActionMessage("按住三横线并拖拽可调整顺序");
+                                  }
+                                }}
+                              >
+                                <span />
+                                <span />
+                                <span />
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
                   <div className="settingsSubsection">
                     <div className="settingsHeader compact">
@@ -5028,7 +5403,97 @@ function MainApp() {
           </div>
         ) : null}
 
-        {viewMode === "launcher" && !showSettings ? (
+        {slashBoardActive ? (
+          <div className="slashBoard" aria-label="Slash Board">
+            <nav className="slashBoardRail" aria-label="Slash Board 范围">
+              {visibleSlashBoardScopes.map((scope) => (
+                <button
+                  className={
+                    slashBoardScope === scope.id
+                      ? "slashBoardScope active"
+                      : "slashBoardScope"
+                  }
+                  type="button"
+                  aria-current={slashBoardScope === scope.id ? "page" : undefined}
+                  key={scope.id}
+                  onClick={() => {
+                    setSlashBoardScope(scope.id);
+                    setSelectedIndex(0);
+                    focusSearchInput();
+                  }}
+                >
+                  <span>{scope.label}</span>
+                </button>
+              ))}
+            </nav>
+            <section className="slashBoardPane" aria-label={`${activeSlashBoardScope.title} 内容`}>
+              <header className="slashBoardHeader">
+                <span>
+                  <strong>{activeSlashBoardScope.title}</strong>
+                  <small>{activeSlashBoardScope.subtitle}</small>
+                </span>
+                <code>{slashBoardScopePrefix(slashBoardScope, toolMenuAlias)}</code>
+              </header>
+              <div className="slashBoardResults">
+                {slashBoardResults.map((result, index) => (
+                  <ResultRow
+                    actions={<span className="resultAction">{resultActionLabel(result)}</span>}
+                    className="slashBoardResultItem"
+                    icon={resultIcon(result)}
+                    iconPath={result.iconPath}
+                    iconRetryKey={resultsRevision + slashBoardRevision}
+                    key={result.id}
+                    onClick={async () => {
+                      setSelectedIndex(index);
+                      await executeSelectedResult(result);
+                    }}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      setSelectedIndex(index);
+                      openResultContextMenu(result);
+                    }}
+                    onKeyDown={(event) => {
+                      if (
+                        event.key === "ArrowDown" ||
+                        event.key === "ArrowUp" ||
+                        event.key === "ArrowLeft" ||
+                        event.key === "ArrowRight"
+                      ) {
+                        handleSearchNavigationKeyDown(event);
+                        focusSearchInput();
+                        return;
+                      }
+
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSelectedIndex(index);
+                        if (event.key === "Enter" && event.shiftKey) {
+                          openResultContextMenu(result);
+                          return;
+                        }
+                        executeSelectedResult(result);
+                      }
+                    }}
+                    role="button"
+                    ref={(element) => {
+                      resultItemRefs.current[index] = element;
+                    }}
+                    selected={index === selectedIndex}
+                  >
+                    <strong>{result.title}</strong>
+                    <small>{result.subtitle}</small>
+                    {result.fileMetadata ? (
+                      <span className="fileMetaLine">{formatFileMetadata(result.fileMetadata)}</span>
+                    ) : null}
+                  </ResultRow>
+                ))}
+                {slashBoardResults.length === 0 ? <div className="slashBoardEmpty">没有内容</div> : null}
+              </div>
+            </section>
+          </div>
+        ) : null}
+
+        {viewMode === "launcher" && !showSettings && !slashBoardActive && (contextSession || query.trim().length > 0) ? (
           <div className={contextSession ? "resultList contextResultList" : "resultList"}>
             {contextSession ? (
               <div className="contextHeader">
@@ -5054,7 +5519,7 @@ function MainApp() {
                   contextSession ? (
                     <span className="resultAction">执行</span>
                   ) : (
-                    <span className="resultAction">{actionLabels[result.action]}</span>
+                    <span className="resultAction">{resultActionLabel(result)}</span>
                   )
                 }
                 className={[
@@ -6135,7 +6600,7 @@ function fallbackResults(query: string): SearchResult[] {
 
   const normalizedQuery = query.trim().toLowerCase();
   if (!normalizedQuery) {
-    return allResults;
+    return [];
   }
 
   return allResults.filter(
@@ -6609,14 +7074,239 @@ function isDirectoryResult(result: SearchResult): boolean {
   return result.fileMetadata?.isDir === true || result.source.includes("目录");
 }
 
+function isSlashBoardAliasQuery(query: string, alias: string): boolean {
+  const entryAlias = alias.trim();
+  return Boolean(entryAlias) && query.trim() === entryAlias;
+}
+
+function parseSlashBoardScopeSettings(value: string | null): unknown {
+  if (!value) {
+    return defaultSlashBoardScopeSettings;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return defaultSlashBoardScopeSettings;
+  }
+}
+
+function normalizeSlashBoardScopeSettings(value: unknown): SlashBoardScopeSetting[] {
+  if (!Array.isArray(value)) {
+    return defaultSlashBoardScopeSettings;
+  }
+
+  const knownIds = new Set(slashBoardScopes.map((scope) => scope.id));
+  const seenIds = new Set<SlashBoardScope>();
+  const normalized: SlashBoardScopeSetting[] = [];
+
+  for (const item of value) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const id = (item as { id?: unknown }).id;
+    if (typeof id !== "string" || !knownIds.has(id as SlashBoardScope)) {
+      continue;
+    }
+    const scopeId = id as SlashBoardScope;
+    if (seenIds.has(scopeId)) {
+      continue;
+    }
+    seenIds.add(scopeId);
+    normalized.push({
+      id: scopeId,
+      visible: (item as { visible?: unknown }).visible !== false,
+    });
+  }
+
+  for (const scope of slashBoardScopes) {
+    if (!seenIds.has(scope.id)) {
+      normalized.push({ id: scope.id, visible: true });
+    }
+  }
+
+  return normalized.some((setting) => setting.visible)
+    ? normalized
+    : defaultSlashBoardScopeSettings;
+}
+
+function slashBoardScopesFromSettings(settings: SlashBoardScopeSetting[]) {
+  const scopesById = new Map(slashBoardScopes.map((scope) => [scope.id, scope]));
+  return normalizeSlashBoardScopeSettings(settings)
+    .filter((setting) => setting.visible)
+    .map((setting) => scopesById.get(setting.id))
+    .filter((scope): scope is (typeof slashBoardScopes)[number] => Boolean(scope));
+}
+
+function nextSlashBoardScope(
+  current: SlashBoardScope,
+  direction: 1 | -1,
+  scopes: { id: SlashBoardScope }[],
+): SlashBoardScope {
+  if (scopes.length === 0) {
+    return "all";
+  }
+  const currentIndex = scopes.findIndex((scope) => scope.id === current);
+  const safeIndex = currentIndex >= 0 ? currentIndex : 0;
+  const nextIndex = (safeIndex + direction + scopes.length) % scopes.length;
+  return scopes[nextIndex].id;
+}
+
+function slashBoardPreviewQueries(scope: SlashBoardScope, alias: string): string[] {
+  const entryAlias = alias.trim() || "/";
+  const entryQuery = (category: string) => `${entryAlias}${category}`;
+
+  switch (scope) {
+    case "all":
+      return [
+        entryQuery("recent-apps"),
+        entryQuery("recent-folders"),
+        entryQuery("web"),
+        entryQuery("tools"),
+        entryQuery("cmd"),
+        entryQuery("phrase"),
+      ];
+    case "run":
+      return [entryQuery("cmd")];
+    case "text":
+      return [entryQuery("phrase")];
+    case "web":
+      return [entryQuery("web")];
+    case "tools":
+      return [entryQuery("tools")];
+    case "recent":
+      return [entryQuery("recent-apps"), entryQuery("recent-folders")];
+    case "open":
+    case "system":
+      return [];
+  }
+}
+
+function slashBoardStaticResults(scope: SlashBoardScope): SearchResult[] {
+  if (scope !== "system") {
+    return [];
+  }
+
+  return [settingsSearchResult()];
+}
+
+function settingsSearchResult(): SearchResult {
+  return {
+    id: "internal:settings",
+    title: "设置",
+    subtitle: "打开 Easy Launcher 设置",
+    kind: "command",
+    action: "runCommand",
+    source: "系统",
+    score: 1,
+    shortcut: "Enter",
+  };
+}
+
+function mergeSlashBoardResultGroups(groups: SearchResult[][], limit: number): SearchResult[] {
+  const merged: SearchResult[] = [];
+  const seenIds = new Set<string>();
+  let index = 0;
+
+  while (merged.length < limit) {
+    let added = false;
+    for (const group of groups) {
+      const result = group[index];
+      if (!result || seenIds.has(result.id)) {
+        continue;
+      }
+      seenIds.add(result.id);
+      merged.push(result);
+      added = true;
+      if (merged.length >= limit) {
+        break;
+      }
+    }
+
+    if (!added) {
+      break;
+    }
+    index += 1;
+  }
+
+  return merged;
+}
+
+function slashBoardScopePrefix(scope: SlashBoardScope, alias: string): string {
+  const entryAlias = alias.trim() || "/";
+  switch (scope) {
+    case "all":
+      return entryAlias;
+    case "run":
+      return `${entryAlias}cmd`;
+    case "text":
+      return `${entryAlias}phrase`;
+    case "web":
+      return `${entryAlias}web`;
+    case "tools":
+      return `${entryAlias}tools`;
+    case "recent":
+      return `${entryAlias}recent`;
+    case "open":
+      return `${entryAlias}open`;
+    case "system":
+      return `${entryAlias}system`;
+  }
+}
+
 function resultName(result: SearchResult): string {
   const pathName = result.subtitle.split(/[\\/]/).pop()?.trim();
   return pathName || result.title;
 }
 
-function toolCommandFromResult(result: SearchResult): string | null {
+function isQuickEntryCategoryResult(result: SearchResult): boolean {
+  return result.id.startsWith("quick-entry-category:");
+}
+
+function isQuickEntryWebTemplateResult(result: SearchResult): boolean {
+  return result.id.startsWith("quick-entry-web-template:");
+}
+
+function quickEntryCategoryQuery(result: SearchResult, alias: string): string | null {
+  const category = result.id.replace(/^quick-entry-category:/, "").trim();
+  if (!category) {
+    return null;
+  }
+
+  const entryAlias = alias.trim() || "/";
+  return `${entryAlias}${category} `;
+}
+
+function webTemplateQueryFromResult(result: SearchResult, alias: string): string | null {
+  const keyword = result.title.trim();
+  if (!keyword) {
+    return null;
+  }
+
+  const entryAlias = alias.trim() || "/";
+  return `${entryAlias}web ${keyword} `;
+}
+
+function resultActionLabel(result: SearchResult): string {
+  if (result.id === "internal:settings") {
+    return "打开";
+  }
+
+  if (
+    isQuickEntryCategoryResult(result) ||
+    isQuickEntryWebTemplateResult(result) ||
+    result.id.startsWith("tool-entry:") ||
+    result.id.startsWith("tool-hint:")
+  ) {
+    return "进入";
+  }
+
+  return actionLabels[result.action];
+}
+
+function quickEntryToolQueryFromResult(result: SearchResult, alias: string): string | null {
   const command = result.id.replace(/^tool-(entry|hint):/, "").trim();
-  return command ? `${command} ` : null;
+  const entryAlias = alias.trim() || "/";
+  return command ? `${entryAlias}tools ${command} ` : null;
 }
 
 function formatFileMetadata(metadata: FileMetadata): string {
