@@ -365,6 +365,7 @@
         <ul class="nav">
           <li><a href="#launcher">主启动器</a></li>
           <li><a href="#search">搜索能力</a></li>
+          <li><a href="#quick-entry">快捷入口</a></li>
           <li><a href="#selection">划词菜单</a></li>
           <li><a href="#settings">设置和数据</a></li>
         </ul>
@@ -384,11 +385,15 @@
           <h1>Easy Launcher 产品文档</h1>
           <p class="lead">
             Easy Launcher 是一个基于 Tauri 2、Rust、React、TypeScript 和 Vite 构建的 Windows 桌面启动器。
-            它把应用启动、文件搜索、系统命令、快捷短语、计算器和 AI 文本处理集中在一个紧凑入口里。
+            它把应用启动、文件搜索、系统命令、快捷短语、网页搜索、工具命令、AI 文本处理和可配置快捷入口集中在一个紧凑入口里。
+            日常使用可以双击 <code>Alt</code> 呼出主窗口，也可以按住 <code>Ctrl</code> 后用鼠标划词，直接唤起 AI 小对话框处理选中文本。
           </p>
           <div class="meta-row">
-            <span class="pill">默认主快捷键：Alt+1</span>
-            <span class="pill">划词菜单：Ctrl+Shift+Space</span>
+            <span class="pill">当前版本：v0.2.0</span>
+            <span class="pill">主入口：双击 Alt / Alt+1</span>
+            <span class="pill">划词 AI：Ctrl + 鼠标划词</span>
+            <span class="pill">AI 面板：Alt+3</span>
+            <span class="pill">快捷入口 Alias：/</span>
             <span class="pill">MSI 打包：Tauri 2</span>
             <span class="pill">文件搜索：Everything IPC/HTTP</span>
           </div>
@@ -399,15 +404,19 @@
           <div class="info-grid">
             <div class="info-card">
               <strong>快速搜索</strong>
-              <span>支持应用、文件、命令、计算器、快捷短语、网页搜索和 AI 动作。</span>
+              <span>支持应用、文件、命令、计算器、快捷短语、网页搜索、工具命令和 AI 动作。</span>
+            </div>
+            <div class="info-card">
+              <strong>划词 AI</strong>
+              <span>按住 Ctrl 用鼠标划词，松开后呼出 AI 小对话框，可直接翻译、总结、解释和润色。</span>
+            </div>
+            <div class="info-card">
+              <strong>Slash Board</strong>
+              <span>输入 Alias 打开两列快捷入口，可聚合命令、短语、网页模板、工具和最近打开。</span>
             </div>
             <div class="info-card">
               <strong>桌面集成</strong>
-              <span>支持托盘常驻、全局快捷键、开机自启动、配置导入导出和未签名 MSI 构建。</span>
-            </div>
-            <div class="info-card">
-              <strong>Flow 启发增强</strong>
-              <span>包含异步搜索、缓存、Action Keyword、目录内搜索、搜索学习和 Everything 高级选项。</span>
+              <span>支持托盘常驻、全局快捷键、开机自启动、配置导入导出、更新检查和未签名 MSI 构建。</span>
             </div>
           </div>
         </section>
@@ -454,6 +463,12 @@
 
         <section class="section" id="quick-start">
           <h2>快速开始</h2>
+          <h3>安装 v0.2.0</h3>
+          <p>
+            当前 Windows 安装包产物为
+            <code>Easy Launcher_0.2.0_x64_en-US.msi</code>。MSI 仍未签名，安装时可能出现 Windows 安全提示。
+          </p>
+
           <h3>安装依赖</h3>
           <pre><code>npm install</code></pre>
 
@@ -472,7 +487,8 @@
         <section class="section" id="launcher">
           <h2>主启动器使用</h2>
           <ol>
-            <li>按 <code>Alt+1</code> 打开或隐藏启动器主窗口，隐藏后只保留系统托盘入口，不占用任务栏。</li>
+            <li>双击 <code>Alt</code> 可快速打开启动器主窗口；也可以按 <code>Alt+1</code> 打开或隐藏主窗口。</li>
+            <li>隐藏后只保留系统托盘入口，不占用任务栏。</li>
             <li>输入关键词搜索应用、文件、命令、计算器结果、快捷短语、网页搜索或 AI 动作。</li>
             <li>使用方向键选择结果，按 <code>Enter</code> 执行主动作。</li>
             <li>右键结果或按 <code>Shift+Enter</code> 打开上下文菜单，可执行打开目录、资源管理器选中、复制路径/名称/文件本体、打开方式、配置编辑器、快速访问、当前目录终端、管理员运行、以其他用户运行、删除和隐藏等次级动作。</li>
@@ -509,8 +525,13 @@
               </tr>
               <tr>
                 <td>Action Keyword</td>
-                <td><code>app</code>、<code>file</code>、<code>cmd</code>、<code>calc</code>、<code>clip</code>、<code>phrase</code>、<code>ai</code>、<code>web</code></td>
+                <td><code>app</code>、<code>file</code>、<code>cmd</code>、<code>calc</code>、<code>phrase</code>、<code>ai</code>、<code>web</code></td>
                 <td>通过显式前缀限定搜索来源，未知前缀会按普通查询处理。</td>
+              </tr>
+              <tr>
+                <td>快捷入口 Alias</td>
+                <td><code>/</code>、<code>/cmd</code>、<code>/phrase</code>、<code>/web</code>、<code>/tools</code></td>
+                <td>输入 Alias 本身打开 Slash Board；进入工具后继续保留 Alias，例如 <code>/tools enc </code>。</td>
               </tr>
               <tr>
                 <td>网页搜索模板</td>
@@ -536,12 +557,79 @@
           </div>
         </section>
 
+        <section class="section" id="quick-entry">
+          <h2>快捷入口和 Slash Board</h2>
+          <p>
+            快捷入口默认 Alias 是 <code>/</code>，可在设置页改成 <code>&gt;</code> 等更少冲突的符号。
+            空搜索页保持干净；只有输入 Alias 本身时才进入 Slash Board。
+          </p>
+
+          <table>
+            <thead>
+              <tr>
+                <th>入口</th>
+                <th>内容</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>/</code></td>
+                <td>Slash Board 两列面板</td>
+                <td>左侧是范围 rail，右侧显示当前范围下的具体内容。</td>
+              </tr>
+              <tr>
+                <td><code>/cmd</code></td>
+                <td>自定义命令</td>
+                <td>只展示用户配置的自定义命令，不混入系统命令。</td>
+              </tr>
+              <tr>
+                <td><code>/phrase</code></td>
+                <td>快捷短语</td>
+                <td>空输入展示全部短语，继续输入可按标题和内容过滤。</td>
+              </tr>
+              <tr>
+                <td><code>/web</code></td>
+                <td>网页搜索模板</td>
+                <td><code>/web gh tauri</code> 会使用 <code>gh</code> 模板搜索 <code>tauri</code>。</td>
+              </tr>
+              <tr>
+                <td><code>/tools</code></td>
+                <td>工具命令</td>
+                <td>包含 <code>enc</code>、<code>dec</code>、<code>pwd</code>、<code>time</code>；进入工具时继续保留 Alias。</td>
+              </tr>
+              <tr>
+                <td><code>/recent-apps</code></td>
+                <td>最近打开应用</td>
+                <td>只记录通过 Easy Launcher 打开的 exe 和 <code>.lnk</code> 快捷方式，最多展示 8 条。</td>
+              </tr>
+              <tr>
+                <td><code>/recent-folders</code></td>
+                <td>最近打开目录</td>
+                <td>只展示通过 Easy Launcher 打开的真实目录，不从普通文件反推父目录。</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="doc-block">
+            <h3>Slash Board 菜单配置</h3>
+            <ul>
+              <li>左侧范围包括 <code>All</code>、<code>Run</code>、<code>Text</code>、<code>Web</code>、<code>Tools</code>、<code>Recent</code>、<code>Open</code>、<code>System</code>。</li>
+              <li>设置页可隐藏范围，也可通过三横线手柄拖拽排序。</li>
+              <li>两列排序按列优先展示：左列 01 到 04，右列 05 到 08。</li>
+              <li>至少保留一个可见范围；隐藏范围不影响直接输入对应命令。</li>
+              <li>配置存储在 <code>slash.board.scopes</code>，导入配置时会自动清理未知 id、重复 id 和全 hidden 状态。</li>
+            </ul>
+          </div>
+        </section>
+
         <section class="section" id="selection">
           <h2>划词菜单和 AI 动作</h2>
           <ol>
-            <li>默认模式下，在任意应用中选中文本后按 <code>Ctrl+Shift+Space</code> 呼出划词动作菜单。</li>
-            <li>也可以在设置中把“划词触发”切到“Ctrl+划词”，之后按住 <code>Ctrl</code> 并用鼠标拖选文本，松开鼠标后自动呼出。</li>
-            <li>选择翻译、总结、解释、网页搜索或复制。</li>
+            <li>按 <code>Alt+3</code> 打开 AI 面板，进行普通对话。</li>
+            <li>开启划词功能后，可在任意应用中按住 <code>Ctrl</code> 并用鼠标拖选文本。</li>
+            <li>松开鼠标后会自动呼出划词 AI 小对话框，对选中的内容执行快捷处理。</li>
+            <li>划词动作包括翻译、总结、专业解释、润色和提取要点；可在设置中控制每个动作是否显示。</li>
             <li>取词会临时模拟 <code>Ctrl+C</code>，等待系统剪贴板内容变化后恢复原文本剪贴板。</li>
           </ol>
 
@@ -561,13 +649,15 @@
           <h2>设置和本地数据</h2>
           <h3>可配置项</h3>
           <ul>
-            <li>主启动器快捷键和划词菜单快捷键。</li>
+            <li>主启动器快捷键和 AI 面板快捷键。</li>
             <li>应用、文件、系统命令、计算器、快捷短语、AI、网页搜索等搜索源开关。</li>
+            <li>快捷入口 Alias 和 Slash Board 左侧菜单显示/排序。</li>
             <li>可配置文件编辑器和目录编辑器路径；配置后文件/目录上下文菜单会把当前路径传给对应编辑器。</li>
             <li>搜索权重、网页搜索模板、自定义命令、快捷短语、排除规则。</li>
             <li>Everything 全路径搜索和内容搜索选项。</li>
-            <li>AI Base URL、Model 和 API Key。</li>
+            <li>AI Provider、Model Profile、Assistant 和划词动作入口。</li>
             <li>开机自启动和划词触发模式开关。</li>
+            <li>更新检查开关、检查间隔、预发布版本开关和手动检查。</li>
           </ul>
 
           <h3>数据目录</h3>
@@ -659,7 +749,7 @@
             <tbody>
               <tr>
                 <td>MSI 安装包</td>
-                <td><code>src-tauri\target\release\bundle\msi\</code></td>
+                <td><code>src-tauri\target\release\bundle\msi\Easy Launcher_0.2.0_x64_en-US.msi</code></td>
               </tr>
               <tr>
                 <td>调试可执行文件</td>
@@ -690,8 +780,12 @@ cargo test --manifest-path src-tauri\Cargo.toml</code></pre>
 
           <h3>建议手动验证</h3>
           <ul>
+            <li>双击 <code>Alt</code> 呼出主窗口。</li>
             <li><code>Alt+1</code> 呼出和隐藏主窗口。</li>
             <li>修改主快捷键后无需重启即可生效。</li>
+            <li>按住 <code>Ctrl</code> 并用鼠标划词，松开后应呼出划词 AI 小对话框。</li>
+            <li>输入 <code>/</code> 打开 Slash Board，验证范围切换、拖拽排序和隐藏范围。</li>
+            <li>输入 <code>/tools</code> 选择 <code>enc</code> 后，输入框应进入 <code>/tools enc </code>。</li>
             <li>搜索并启动 3 个本机应用。</li>
             <li>Everything 文件搜索、打开文件和打开目录。</li>
             <li>搜索结果上下文菜单：资源管理器选中、复制路径/名称/文件本体、打开方式、配置编辑器、快速访问、当前目录终端、管理员运行、以其他用户运行、删除和隐藏。</li>
@@ -722,7 +816,7 @@ cargo test --manifest-path src-tauri\Cargo.toml</code></pre>
 
         <footer class="footer">
           <p>文档位置：<code>product-html/index.html</code></p>
-          <p>最近整理：2026-06-06。</p>
+          <p>当前版本：<code>v0.2.0</code>。最近整理：2026-06-08。</p>
         </footer>
       </main>
     </div>
