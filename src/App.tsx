@@ -93,6 +93,22 @@ type SelectionCaptureEvent = {
   y?: number | null;
 };
 
+type Todo = {
+  id: string;
+  text: string;
+  sourceApp?: string | null;
+  remindAt: string;
+  status: "pending" | "done";
+  lastNotifiedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type TodoReminderPayload = {
+  todo: Todo;
+  overdue: boolean;
+};
+
 type SelectionTriggerMode = "ctrl_mouse";
 type ViewMode = "launcher" | "ai";
 type AiSettingsTab = "providers" | "assistants";
@@ -417,7 +433,12 @@ type ResultContextActionId =
   | "runAsUser"
   | "openShortcutTargetParent"
   | "deletePath"
-  | "hideResult";
+  | "hideResult"
+  | "todoComplete"
+  | "todoSnooze"
+  | "todoEditTime"
+  | "todoEditText"
+  | "todoDelete";
 
 type ResultContextAction = {
   id: ResultContextActionId;
@@ -466,6 +487,7 @@ type ErrorScope =
   | "搜索"
   | "系统"
   | "划词"
+  | "待办"
   | "更新";
 
 type SettingsSection =
@@ -517,10 +539,16 @@ const AI_WINDOW_HEIGHT = 680;
 const SLASH_BOARD_WINDOW_MAX_HEIGHT = 420;
 const SLASH_BOARD_RESULT_LIMIT = 8;
 const SELECTION_PICKER_WINDOW_WIDTH = 520;
-const SELECTION_PICKER_WINDOW_HEIGHT = 48;
+const SELECTION_PICKER_WINDOW_HEIGHT = 52;
+const SELECTION_TODO_WINDOW_WIDTH = 520;
+const SELECTION_TODO_WINDOW_HEIGHT = 300;
 const SELECTION_RESULT_WINDOW_WIDTH = 520;
 const SELECTION_RESULT_WINDOW_HEIGHT = 420;
-const SELECTION_PRIMARY_ACTION_LIMIT = 5;
+const SELECTION_PICKER_ACTION_LIMIT = 6;
+const SELECTION_PICKER_FIXED_ACTION_COUNT = 2;
+const SELECTION_PICKER_OVERFLOW_ACTION_COUNT = 1;
+const SELECTION_RESULT_PRIMARY_ACTION_LIMIT = 6;
+const TODO_SNOOZE_MINUTES = 10;
 const MODEL_BINDING_SEPARATOR = "::";
 const SEARCH_WINDOW_MIN_HEIGHT = 64;
 const SEARCH_WINDOW_MAX_HEIGHT = 286;
@@ -563,7 +591,14 @@ const defaultSlashBoardScopeSettings: SlashBoardScopeSetting[] = slashBoardScope
 }));
 
 function App() {
-  return getCurrentWindow().label === "selection" ? <SelectionAssistantApp /> : <MainApp />;
+  const label = getCurrentWindow().label;
+  if (label === "selection") {
+    return <SelectionAssistantApp />;
+  }
+  if (label === "reminder") {
+    return <TodoReminderApp />;
+  }
+  return <MainApp />;
 }
 
 function MainApp() {
@@ -2735,6 +2770,42 @@ function MainApp() {
     }
   }
 
+  async function clearSelectionMarks() {
+    if (!window.confirm("清空划词记录？\n\n这些临时记录不会进入配置导出，清空后无法恢复。")) {
+      return;
+    }
+
+    try {
+      const cleared = await invoke<number>("clear_selection_marks");
+      const response = await invokeSearchWithRecents(query);
+      if (response !== null) {
+        setSearchResults(response);
+      }
+      setActionMessage(`已清空划词记录：${cleared} 条`);
+      clearError();
+    } catch (error) {
+      showError("配置", "划词记录清空失败", error);
+    }
+  }
+
+  async function clearCompletedTodos() {
+    if (!window.confirm("清空已完成待办？\n\n未完成的提醒会保留。")) {
+      return;
+    }
+
+    try {
+      const cleared = await invoke<number>("clear_completed_todos");
+      const response = await invokeSearchWithRecents(query);
+      if (response !== null) {
+        setSearchResults(response);
+      }
+      setActionMessage(`已清空已完成待办：${cleared} 条`);
+      clearError();
+    } catch (error) {
+      showError("配置", "已完成待办清空失败", error);
+    }
+  }
+
   async function refreshIconCacheStatus() {
     try {
       const status = await invoke<IconCacheStatus>("icon_cache_status");
@@ -3005,6 +3076,11 @@ function MainApp() {
         return;
       }
       await enterSearchQuery(nextQuery, `已进入：${result.title}`);
+      return;
+    }
+
+    if (result.id.startsWith("todo:")) {
+      openResultContextMenu(result);
       return;
     }
 
@@ -3321,6 +3397,101 @@ function MainApp() {
     }
   }
 
+  async function refreshTodoSearch(message: string) {
+    const response = await invokeSearchWithRecents(query);
+    if (response !== null) {
+      setSearchResults(response);
+      setSelectedIndex(0);
+    }
+    setActionMessage(message);
+    clearError();
+  }
+
+  async function completeTodoResult(result: SearchResult) {
+    try {
+      await invoke<Todo>("complete_todo", { id: result.id });
+      await refreshTodoSearch(`已完成待办：${result.title}`);
+    } catch (error) {
+      showError("待办", `完成待办失败：${result.title}`, error);
+    }
+  }
+
+  async function snoozeTodoResult(result: SearchResult) {
+    try {
+      await invoke<Todo>("snooze_todo", { id: result.id, minutes: TODO_SNOOZE_MINUTES });
+      await refreshTodoSearch(`已稍后 ${TODO_SNOOZE_MINUTES} 分钟：${result.title}`);
+    } catch (error) {
+      showError("待办", `稍后提醒失败：${result.title}`, error);
+    }
+  }
+
+  async function editTodoReminderTime(result: SearchResult) {
+    const value = window.prompt(
+      "输入新的提醒时间，例如 2026-06-09 21:30",
+      localDateTimeInputValue(defaultTodoCustomDate()),
+    );
+    if (!value?.trim()) {
+      setActionMessage(`已取消修改提醒时间：${result.title}`);
+      return;
+    }
+
+    const remindAt = parsePromptLocalDateTime(value);
+    if (!remindAt) {
+      showError("待办", "提醒时间格式无效");
+      return;
+    }
+    if (remindAt.getTime() <= Date.now() + 60_000) {
+      showError("待办", "提醒时间必须晚于当前时间");
+      return;
+    }
+
+    try {
+      await invoke<Todo>("update_todo", {
+        input: {
+          id: result.id,
+          remindAt: remindAt.toISOString(),
+        },
+      });
+      await refreshTodoSearch(`已修改提醒时间：${formatTodoReminderTime(remindAt)}`);
+    } catch (error) {
+      showError("待办", `修改提醒时间失败：${result.title}`, error);
+    }
+  }
+
+  async function editTodoText(result: SearchResult) {
+    const value = window.prompt("修改待办内容", result.title);
+    if (!value?.trim()) {
+      setActionMessage(`已取消修改待办：${result.title}`);
+      return;
+    }
+
+    try {
+      await invoke<Todo>("update_todo", {
+        input: {
+          id: result.id,
+          text: value.trim(),
+        },
+      });
+      await refreshTodoSearch(`已修改待办：${value.trim()}`);
+    } catch (error) {
+      showError("待办", `修改待办失败：${result.title}`, error);
+    }
+  }
+
+  async function deleteTodoResult(result: SearchResult) {
+    if (!window.confirm(`删除此待办？\n\n${result.title}`)) {
+      setActionMessage(`已取消删除待办：${result.title}`);
+      return;
+    }
+
+    try {
+      await invoke("delete_todo", { id: result.id });
+      await refreshTodoSearch(`已删除待办：${result.title}`);
+    } catch (error) {
+      showError("待办", `删除待办失败：${result.title}`, error);
+    }
+  }
+
   function openResultContextMenu(result: SearchResult) {
     const actions = contextActionsForResult(
       result,
@@ -3411,6 +3582,21 @@ function MainApp() {
         return;
       case "hideResult":
         await hideResultFromSearch(result);
+        return;
+      case "todoComplete":
+        await completeTodoResult(result);
+        return;
+      case "todoSnooze":
+        await snoozeTodoResult(result);
+        return;
+      case "todoEditTime":
+        await editTodoReminderTime(result);
+        return;
+      case "todoEditText":
+        await editTodoText(result);
+        return;
+      case "todoDelete":
+        await deleteTodoResult(result);
         return;
       default:
         return;
@@ -4644,6 +4830,38 @@ function MainApp() {
 
                   <div className="settingsSubsection">
                     <div className="settingsHeader compact">
+                      <strong>划词记录</strong>
+                      <small>记录只通过 /mark 取回，不进入普通搜索，也不会写入配置导出</small>
+                    </div>
+                    <div className="sourceToggles" aria-label="划词记录操作">
+                      <button
+                        className="sourceToggle dangerToggle"
+                        type="button"
+                        onClick={clearSelectionMarks}
+                      >
+                        清空划词记录
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="settingsSubsection">
+                    <div className="settingsHeader compact">
+                      <strong>待办提醒</strong>
+                      <small>待办只通过 /todo 管理；已完成项可定期清理</small>
+                    </div>
+                    <div className="sourceToggles" aria-label="待办提醒操作">
+                      <button
+                        className="sourceToggle dangerToggle"
+                        type="button"
+                        onClick={clearCompletedTodos}
+                      >
+                        清空已完成待办
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="settingsSubsection">
+                    <div className="settingsHeader compact">
                       <strong>可用助手</strong>
                       <small>
                         已显示 {visibleSelectionActions.length} 个；浮窗默认展示前 5 个，其余通过横向滚动访问
@@ -5604,7 +5822,8 @@ type SelectionActionSession = {
   error: string | null;
 };
 
-type SelectionViewMode = "picker" | "result";
+type SelectionViewMode = "picker" | "todoTime" | "result";
+type TodoTimePreset = "10m" | "30m" | "1h" | "tonight" | "tomorrowMorning" | "custom";
 
 function SelectionAssistantApp() {
   const [capture, setCapture] = useState<SelectionCaptureEvent | null>(null);
@@ -5620,6 +5839,13 @@ function SelectionAssistantApp() {
   );
   const [viewMode, setViewMode] = useState<SelectionViewMode>("picker");
   const [showMoreActions, setShowMoreActions] = useState(false);
+  const [pickerNotice, setPickerNotice] = useState<string | null>(null);
+  const [isSavingMark, setIsSavingMark] = useState(false);
+  const [todoTimePreset, setTodoTimePreset] = useState<TodoTimePreset>("1h");
+  const [todoCustomDate, setTodoCustomDate] = useState("");
+  const [todoCustomTime, setTodoCustomTime] = useState("");
+  const [todoNotice, setTodoNotice] = useState<string | null>(null);
+  const [isSavingTodo, setIsSavingTodo] = useState(false);
   const [status, setStatus] = useState("等待选择动作");
   const [languageOption, setLanguageOption] = useState<LanguageOption>("system");
   const activeRequestRef = useRef<{ requestId: string; assistantId: string } | null>(null);
@@ -5637,8 +5863,19 @@ function SelectionAssistantApp() {
   const selectedProviderModels = enabledModels.filter(
     (model) => model.providerId === selectedProviderId,
   );
-  const primarySelectionActions = actions.slice(0, SELECTION_PRIMARY_ACTION_LIMIT);
-  const overflowSelectionActions = actions.slice(SELECTION_PRIMARY_ACTION_LIMIT);
+  const pickerMaxActionCount = Math.max(
+    0,
+    SELECTION_PICKER_ACTION_LIMIT - SELECTION_PICKER_FIXED_ACTION_COUNT,
+  );
+  const pickerHasOverflow = actions.length > pickerMaxActionCount;
+  const pickerPrimaryActionLimit = Math.max(
+    0,
+    pickerMaxActionCount - (pickerHasOverflow ? SELECTION_PICKER_OVERFLOW_ACTION_COUNT : 0),
+  );
+  const pickerPrimarySelectionActions = actions.slice(0, pickerPrimaryActionLimit);
+  const pickerOverflowSelectionActions = actions.slice(pickerPrimaryActionLimit);
+  const primarySelectionActions = actions.slice(0, SELECTION_RESULT_PRIMARY_ACTION_LIMIT);
+  const overflowSelectionActions = actions.slice(SELECTION_RESULT_PRIMARY_ACTION_LIMIT);
   const sourceText = capture?.result.ok ? capture.result.text : "";
   useEffect(() => {
     invoke<string | null>("get_setting", {
@@ -5763,6 +6000,14 @@ function SelectionAssistantApp() {
     setSessions({});
     setSelectedActionId(null);
     setShowMoreActions(false);
+    setPickerNotice(null);
+    setIsSavingMark(false);
+    setTodoTimePreset("1h");
+    setTodoNotice(null);
+    setIsSavingTodo(false);
+    const defaultCustomDate = defaultTodoCustomDate();
+    setTodoCustomDate(localDateInputValue(defaultCustomDate));
+    setTodoCustomTime(localTimeInputValue(defaultCustomDate));
     setViewMode("picker");
     startedInitialSelectionKeys.current.clear();
     setStatus(event.result.message);
@@ -5863,12 +6108,26 @@ function SelectionAssistantApp() {
     if (mode === "picker") {
       const pickerHeight =
         SELECTION_PICKER_WINDOW_HEIGHT +
-        (showMoreActions ? Math.min(overflowSelectionActions.length, 6) * 30 + 8 : 0);
+        (showMoreActions ? Math.min(pickerOverflowSelectionActions.length, 6) * 30 + 8 : 0);
       windowHandle
         .setMinSize(null)
         .then(() =>
           windowHandle.setSize(
             new LogicalSize(SELECTION_PICKER_WINDOW_WIDTH, pickerHeight),
+          ),
+        )
+        .catch(() => {
+          // Browser preview has no desktop selection window to resize.
+        });
+      return;
+    }
+
+    if (mode === "todoTime") {
+      windowHandle
+        .setMinSize(new LogicalSize(SELECTION_TODO_WINDOW_WIDTH, SELECTION_TODO_WINDOW_HEIGHT))
+        .then(() =>
+          windowHandle.setSize(
+            new LogicalSize(SELECTION_TODO_WINDOW_WIDTH, SELECTION_TODO_WINDOW_HEIGHT),
           ),
         )
         .catch(() => {
@@ -5887,6 +6146,86 @@ function SelectionAssistantApp() {
       .catch(() => {
         // Browser preview has no desktop selection window to resize.
       });
+  }
+
+  async function saveSelectionMark() {
+    if (!sourceText.trim()) {
+      setPickerNotice("没有读取到选中文本");
+      setStatus("没有读取到选中文本");
+      return;
+    }
+    if (isSavingMark) {
+      return;
+    }
+
+    setIsSavingMark(true);
+    setPickerNotice(null);
+    setStatus("正在记录");
+    try {
+      await invoke("save_selection_mark", {
+        input: {
+          text: sourceText,
+          sourceApp: null,
+        },
+      });
+      setPickerNotice("已记录");
+      setStatus("已记录");
+      window.setTimeout(closeSelectionWindow, 450);
+    } catch (error) {
+      const message = errorMessage(error, "划词记录保存失败");
+      setPickerNotice(message);
+      setStatus(message);
+    } finally {
+      setIsSavingMark(false);
+    }
+  }
+
+  function openTodoTimePicker() {
+    if (!sourceText.trim()) {
+      setPickerNotice("没有读取到选中文本");
+      return;
+    }
+    const defaultCustomDate = defaultTodoCustomDate();
+    setTodoTimePreset("1h");
+    setTodoCustomDate(localDateInputValue(defaultCustomDate));
+    setTodoCustomTime(localTimeInputValue(defaultCustomDate));
+    setTodoNotice(null);
+    setShowMoreActions(false);
+    setViewMode("todoTime");
+    setStatus("选择提醒时间");
+  }
+
+  async function saveSelectionTodo() {
+    if (!sourceText.trim() || isSavingTodo) {
+      return;
+    }
+    const remindAt = todoReminderDate(todoTimePreset, todoCustomDate, todoCustomTime);
+    if (!remindAt || remindAt.getTime() <= Date.now() + 60_000) {
+      setTodoNotice("提醒时间必须晚于当前时间");
+      return;
+    }
+
+    setIsSavingTodo(true);
+    setTodoNotice(null);
+    try {
+      await invoke<Todo>("save_todo", {
+        input: {
+          text: sourceText,
+          sourceApp: null,
+          remindAt: remindAt.toISOString(),
+        },
+      });
+      const message = `已加入待办，将于 ${formatTodoReminderTime(remindAt)} 提醒`;
+      setTodoNotice(message);
+      setStatus(message);
+      window.setTimeout(closeSelectionWindow, 500);
+    } catch (error) {
+      const message = errorMessage(error, "待办保存失败");
+      setTodoNotice(message);
+      setStatus(message);
+    } finally {
+      setIsSavingTodo(false);
+    }
   }
 
   async function selectAction(action: AiSelectionAction) {
@@ -6088,14 +6427,14 @@ function SelectionAssistantApp() {
   }
 
   function startWindowDrag(event: ReactMouseEvent<HTMLElement>) {
-    if (
-      event.target instanceof HTMLInputElement ||
-      event.target instanceof HTMLButtonElement ||
-      event.target instanceof HTMLTextAreaElement ||
-      event.target instanceof HTMLSelectElement
-    ) {
+    if (event.button !== 0) {
       return;
     }
+
+    if (isInteractiveDragTarget(event.target)) {
+      return;
+    }
+
     getCurrentWindow()
       .startDragging()
       .catch(() => {
@@ -6117,16 +6456,33 @@ function SelectionAssistantApp() {
     const pickerMessage =
       capture && !capture.result.ok
         ? capture.result.message
-        : actions.length === 0
-          ? "没有可用划词助手"
-          : status;
+        : pickerNotice ?? (actions.length === 0 ? "没有可用划词助手" : status);
+    const showPickerActions = Boolean(capture?.result.ok && !pickerNotice);
 
     return (
       <main className="selectionAssistantShell picker" onMouseDown={startWindowDrag}>
         <section className="selectionPickerPanel" aria-label="划词动作选择">
-          {primarySelectionActions.length > 0 && capture?.result.ok ? (
+          {showPickerActions ? (
             <div className="selectionPickerActions" role="group" aria-label="划词动作">
-              {primarySelectionActions.map((action) => (
+              <button
+                className="selectionPickerIconAction"
+                type="button"
+                onClick={saveSelectionMark}
+                disabled={isSavingMark}
+                aria-label="记录"
+                title="保存当前划词原文"
+              >
+                <SelectionMarkIcon />
+              </button>
+              <button
+                type="button"
+                onClick={openTodoTimePicker}
+                disabled={isSavingTodo}
+                title="设置提醒时间并加入待办"
+              >
+                待办
+              </button>
+              {pickerPrimarySelectionActions.map((action) => (
                 <button
                   type="button"
                   key={action.assistantId}
@@ -6137,7 +6493,7 @@ function SelectionAssistantApp() {
                   {action.selectionLabel}
                 </button>
               ))}
-              {overflowSelectionActions.length > 0 ? (
+              {pickerOverflowSelectionActions.length > 0 ? (
                 <div className="selectionMoreActions">
                   <button
                     type="button"
@@ -6151,7 +6507,7 @@ function SelectionAssistantApp() {
                   </button>
                   {showMoreActions ? (
                     <div className="selectionMoreMenu" role="menu">
-                      {overflowSelectionActions.map((action) => (
+                      {pickerOverflowSelectionActions.map((action) => (
                         <button
                           type="button"
                           role="menuitem"
@@ -6170,9 +6526,81 @@ function SelectionAssistantApp() {
           ) : (
             <span className="selectionPickerStatus">{pickerMessage}</span>
           )}
-          <button type="button" className="selectionPickerClose" onClick={closeSelectionWindow} aria-label="关闭">
-            x
+          <button
+            type="button"
+            className="selectionPickerClose"
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              closeSelectionWindow();
+            }}
+            aria-label="关闭"
+          >
+            <SelectionCloseIcon />
           </button>
+        </section>
+      </main>
+    );
+  }
+
+  if (viewMode === "todoTime") {
+    const presetOptions = todoTimePresetOptions();
+    const remindAt = todoReminderDate(todoTimePreset, todoCustomDate, todoCustomTime);
+    const reminderPreview =
+      remindAt && remindAt.getTime() > Date.now() + 60_000
+        ? `将于 ${formatTodoReminderTime(remindAt)} 提醒`
+        : "提醒时间必须晚于当前时间";
+    const todoNoticeIsError = Boolean(todoNotice && !todoNotice.startsWith("已加入待办"));
+
+    return (
+      <main className="selectionAssistantShell todoTime" onMouseDown={startWindowDrag}>
+        <section className="selectionTodoPanel" aria-label="划词待办时间选择">
+          <header className="selectionTodoHeader">
+            <span>
+              <strong>加入待办</strong>
+              <small>{previewDisplayText(sourceText, 96)}</small>
+            </span>
+            <button type="button" onClick={() => setViewMode("picker")}>
+              取消
+            </button>
+          </header>
+          <div className="selectionTodoPresets" role="group" aria-label="提醒时间">
+            {presetOptions.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                className={todoTimePreset === option.id ? "active" : ""}
+                onClick={() => setTodoTimePreset(option.id)}
+              >
+                <strong>{option.label}</strong>
+                <small>{option.detail}</small>
+              </button>
+            ))}
+          </div>
+          {todoTimePreset === "custom" ? (
+            <div className="selectionTodoCustom">
+              <input
+                aria-label="提醒日期"
+                type="date"
+                value={todoCustomDate}
+                onChange={(event) => setTodoCustomDate(event.target.value)}
+              />
+              <input
+                aria-label="提醒时间"
+                type="time"
+                value={todoCustomTime}
+                onChange={(event) => setTodoCustomTime(event.target.value)}
+              />
+            </div>
+          ) : null}
+          <footer className="selectionTodoFooter">
+            <span className={todoNoticeIsError ? "selectionInlineError" : ""}>
+              {todoNotice ?? reminderPreview}
+            </span>
+            <button type="button" onClick={saveSelectionTodo} disabled={isSavingTodo}>
+              {isSavingTodo ? "加入中" : "加入待办"}
+            </button>
+          </footer>
         </section>
       </main>
     );
@@ -6329,6 +6757,140 @@ function SelectionAssistantApp() {
           aria-label="调整窗口大小"
           title="调整窗口大小"
         />
+      </section>
+    </main>
+  );
+}
+
+function SelectionMarkIcon() {
+  return (
+    <svg className="selectionPickerIconSvg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M6.5 4.5h8l3 3v12H6.5v-15Z" />
+      <path d="M14.5 4.5v3h3" />
+      <path d="M9.5 9h4" />
+      <path d="M9.5 12h2.5" />
+      <path d="M14.5 12.5v4" />
+      <path d="M12.5 14.5h4" />
+    </svg>
+  );
+}
+
+function SelectionCloseIcon() {
+  return (
+    <svg className="selectionPickerCloseIcon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M7 7l10 10" />
+      <path d="M17 7L7 17" />
+    </svg>
+  );
+}
+
+function TodoReminderApp() {
+  const [reminder, setReminder] = useState<TodoReminderPayload | null>(null);
+  const [status, setStatus] = useState("等待提醒");
+  const [languageOption, setLanguageOption] = useState<LanguageOption>("system");
+  const reminderRef = useRef<TodoReminderPayload | null>(null);
+  const displayLanguage = resolveDisplayLanguage(languageOption);
+  useDisplayTranslations(displayLanguage);
+
+  useEffect(() => {
+    invoke<string | null>("get_setting", {
+      key: "ui.language",
+    })
+      .then((value) => setLanguageOption(normalizeLanguagePreference(value)))
+      .catch(() => setLanguageOption("system"));
+
+    invoke<TodoReminderPayload | null>("get_pending_todo_reminder")
+      .then((payload) => {
+        if (payload) {
+          showReminder(payload);
+        }
+      })
+      .catch(() => {
+        // Browser preview has no backend reminder state.
+      });
+
+    const unlisteners: Array<() => void> = [];
+    listen<TodoReminderPayload>("todo-reminder", (event) => {
+      showReminder(event.payload);
+    }).then((handler) => unlisteners.push(handler));
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        snoozeReminder();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown, true);
+
+    return () => {
+      unlisteners.forEach((unlisten) => unlisten());
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, []);
+
+  function showReminder(payload: TodoReminderPayload) {
+    reminderRef.current = payload;
+    setReminder(payload);
+    setStatus(payload.overdue ? "已过期" : "到时间了");
+  }
+
+  async function completeReminder() {
+    const currentReminder = reminderRef.current;
+    if (!currentReminder) {
+      return;
+    }
+    reminderRef.current = null;
+    setReminder(null);
+    setStatus("已完成");
+    try {
+      await invoke<Todo>("complete_todo", { id: currentReminder.todo.id });
+    } catch (error) {
+      reminderRef.current = currentReminder;
+      setReminder(currentReminder);
+      setStatus(errorMessage(error, "完成待办失败"));
+    }
+  }
+
+  async function snoozeReminder() {
+    const currentReminder = reminderRef.current;
+    if (!currentReminder) {
+      return;
+    }
+    reminderRef.current = null;
+    setReminder(null);
+    setStatus(`已稍后 ${TODO_SNOOZE_MINUTES} 分钟`);
+    try {
+      await invoke<Todo>("snooze_todo", {
+        id: currentReminder.todo.id,
+        minutes: TODO_SNOOZE_MINUTES,
+      });
+    } catch (error) {
+      reminderRef.current = currentReminder;
+      setReminder(currentReminder);
+      setStatus(errorMessage(error, "稍后提醒失败"));
+    }
+  }
+
+  return (
+    <main className="reminderShell">
+      <section className="reminderPanel" aria-label="待办提醒">
+        <header className="reminderHeader">
+          <span>
+            <strong>待办提醒</strong>
+            <small>{status}</small>
+          </span>
+        </header>
+        <p>{reminder ? reminder.todo.text : "暂无待处理提醒"}</p>
+        {reminder ? (
+          <footer>
+            <button type="button" onClick={snoozeReminder}>
+              稍后
+            </button>
+            <button type="button" onClick={completeReminder}>
+              完成
+            </button>
+          </footer>
+        ) : null}
       </section>
     </main>
   );
@@ -6879,6 +7441,37 @@ function contextActionsForResult(
   pinnedResults: PinnedResult[] = [],
   resultAliases: ResultAlias[] = [],
 ): ResultContextAction[] {
+  if (result.id.startsWith("todo:")) {
+    return [
+      {
+        id: "todoComplete",
+        title: "完成",
+        subtitle: result.title,
+      },
+      {
+        id: "todoSnooze",
+        title: `稍后 ${TODO_SNOOZE_MINUTES} 分钟`,
+        subtitle: result.subtitle,
+      },
+      {
+        id: "todoEditTime",
+        title: "修改提醒时间",
+        subtitle: result.subtitle,
+      },
+      {
+        id: "todoEditText",
+        title: "修改内容",
+        subtitle: result.title,
+      },
+      {
+        id: "todoDelete",
+        title: "删除",
+        subtitle: result.title,
+        danger: true,
+      },
+    ];
+  }
+
   const actions: ResultContextAction[] = [
     {
       id: "execute",
@@ -7058,7 +7651,12 @@ function matchesExcludableResult(result: SearchResult): boolean {
 }
 
 function matchesRankableResult(result: SearchResult): boolean {
-  return !result.id.startsWith("internal:") && ["app", "file", "command", "webSearch"].includes(result.kind);
+  return (
+    !result.id.startsWith("internal:") &&
+    !result.id.startsWith("mark:") &&
+    !result.id.startsWith("todo:") &&
+    ["app", "file", "command", "webSearch"].includes(result.kind)
+  );
 }
 
 function resultRankingInput(result: SearchResult) {
@@ -7164,11 +7762,13 @@ function slashBoardPreviewQueries(scope: SlashBoardScope, alias: string): string
         entryQuery("tools"),
         entryQuery("cmd"),
         entryQuery("phrase"),
+        entryQuery("mark"),
+        entryQuery("todo"),
       ];
     case "run":
       return [entryQuery("cmd")];
     case "text":
-      return [entryQuery("phrase")];
+      return [entryQuery("phrase"), entryQuery("mark"), entryQuery("todo")];
     case "web":
       return [entryQuery("web")];
     case "tools":
@@ -7200,6 +7800,120 @@ function settingsSearchResult(): SearchResult {
     score: 1,
     shortcut: "Enter",
   };
+}
+
+function todoTimePresetOptions(): Array<{ id: TodoTimePreset; label: string; detail: string }> {
+  return [
+    todoPresetOption("10m", "10 分钟后"),
+    todoPresetOption("30m", "30 分钟后"),
+    todoPresetOption("1h", "1 小时后"),
+    todoPresetOption("tonight", tonightPresetLabel()),
+    todoPresetOption("tomorrowMorning", "明早 09:00"),
+    todoPresetOption("custom", "自定义"),
+  ];
+}
+
+function todoPresetOption(id: TodoTimePreset, label: string) {
+  const date = todoReminderDate(id, "", "");
+  return {
+    id,
+    label,
+    detail: date ? formatTodoReminderTime(date) : "选择日期时间",
+  };
+}
+
+function todoReminderDate(
+  preset: TodoTimePreset,
+  customDate: string,
+  customTime: string,
+): Date | null {
+  const now = new Date();
+  if (preset === "10m") {
+    return new Date(now.getTime() + 10 * 60_000);
+  }
+  if (preset === "30m") {
+    return new Date(now.getTime() + 30 * 60_000);
+  }
+  if (preset === "1h") {
+    return new Date(now.getTime() + 60 * 60_000);
+  }
+  if (preset === "tonight") {
+    const target = new Date(now);
+    target.setHours(20, 0, 0, 0);
+    if (target.getTime() <= now.getTime()) {
+      target.setDate(target.getDate() + 1);
+    }
+    return target;
+  }
+  if (preset === "tomorrowMorning") {
+    const target = new Date(now);
+    target.setDate(target.getDate() + 1);
+    target.setHours(9, 0, 0, 0);
+    return target;
+  }
+  if (!customDate || !customTime) {
+    return null;
+  }
+  const parsed = new Date(`${customDate}T${customTime}:00`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function tonightPresetLabel(): string {
+  const now = new Date();
+  const tonight = new Date(now);
+  tonight.setHours(20, 0, 0, 0);
+  return tonight.getTime() <= now.getTime() ? "明晚 20:00" : "今晚 20:00";
+}
+
+function defaultTodoCustomDate(): Date {
+  const value = new Date(Date.now() + 60 * 60_000);
+  const remainder = value.getMinutes() % 5;
+  if (remainder === 0) {
+    value.setSeconds(0, 0);
+  } else {
+    value.setMinutes(value.getMinutes() + (5 - remainder), 0, 0);
+  }
+  return value;
+}
+
+function localDateInputValue(date: Date): string {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function localTimeInputValue(date: Date): string {
+  const hours = `${date.getHours()}`.padStart(2, "0");
+  const minutes = `${date.getMinutes()}`.padStart(2, "0");
+  return `${hours}:${minutes}`;
+}
+
+function localDateTimeInputValue(date: Date): string {
+  return `${localDateInputValue(date)} ${localTimeInputValue(date)}`;
+}
+
+function parsePromptLocalDateTime(value: string): Date | null {
+  const normalized = value.trim().replace(" ", "T");
+  const parsed = new Date(normalized.length === 16 ? `${normalized}:00` : normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatTodoReminderTime(date: Date): string {
+  return date.toLocaleString("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function previewDisplayText(text: string, limit: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= limit) {
+    return compact;
+  }
+  return `${compact.slice(0, Math.max(0, limit - 1))}…`;
 }
 
 function mergeSlashBoardResultGroups(groups: SearchResult[][], limit: number): SearchResult[] {

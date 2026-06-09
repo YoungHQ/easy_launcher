@@ -1,3 +1,4 @@
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -5,11 +6,15 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type StorageState = Arc<Mutex<Storage>>;
 
 const APP_DATA_DIR: &str = "EasyLauncher";
 const WEB_SEARCH_QUERY_PLACEHOLDER: &str = "{query}";
+const SELECTION_MARK_TEXT_MAX_CHARS: usize = 20_000;
+const SELECTION_MARK_STORAGE_LIMIT: usize = 500;
+const TODO_TEXT_MAX_CHARS: usize = 20_000;
 pub const DEFAULT_AI_MODEL_PROFILE_ID: &str = "default-openai-compatible";
 pub const DEFAULT_AI_PROVIDER_ID: &str = "default-openai-compatible-provider";
 pub const DEFAULT_AI_ASSISTANT_ID: &str = "default-assistant";
@@ -97,6 +102,52 @@ pub struct PhraseInput {
     pub id: Option<String>,
     pub title: String,
     pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionMark {
+    pub id: String,
+    pub text: String,
+    pub source_app: Option<String>,
+    pub created_at: String,
+    pub use_count: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionMarkInput {
+    pub text: String,
+    pub source_app: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Todo {
+    pub id: String,
+    pub text: String,
+    pub source_app: Option<String>,
+    pub remind_at: String,
+    pub status: String,
+    pub last_notified_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoInput {
+    pub text: String,
+    pub source_app: Option<String>,
+    pub remind_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoUpdateInput {
+    pub id: String,
+    pub text: Option<String>,
+    pub remind_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -931,6 +982,280 @@ impl Storage {
         )?;
 
         Ok(())
+    }
+
+    pub fn list_selection_marks(&self) -> Result<Vec<SelectionMark>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, text, source_app, created_at, use_count
+             FROM selection_marks
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = statement.query_map([], selection_mark_from_row)?;
+
+        let mut marks = Vec::new();
+        for row in rows {
+            marks.push(row?);
+        }
+
+        Ok(marks)
+    }
+
+    pub fn save_selection_mark(
+        &self,
+        input: SelectionMarkInput,
+    ) -> Result<SelectionMark, StorageError> {
+        self.save_selection_mark_with_limit(input, SELECTION_MARK_STORAGE_LIMIT)
+    }
+
+    fn save_selection_mark_with_limit(
+        &self,
+        input: SelectionMarkInput,
+        limit: usize,
+    ) -> Result<SelectionMark, StorageError> {
+        let text = input.text.trim();
+        validate_selection_mark_text(text).map_err(StorageError::Validation)?;
+        let source_app = normalize_optional_text(input.source_app);
+        let id = generated_record_id("mark");
+
+        self.connection.execute(
+            "INSERT INTO selection_marks (id, text, source_app, created_at, use_count)
+             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 0)",
+            params![id, text, source_app],
+        )?;
+        self.prune_selection_marks(limit)?;
+
+        self.get_selection_mark(&id)?
+            .ok_or_else(|| StorageError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn delete_selection_mark(&self, id: &str) -> Result<bool, StorageError> {
+        let affected = self
+            .connection
+            .execute("DELETE FROM selection_marks WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
+    pub fn clear_selection_marks(&self) -> Result<usize, StorageError> {
+        let affected = self.connection.execute("DELETE FROM selection_marks", [])?;
+        Ok(affected)
+    }
+
+    pub fn mark_selection_mark_used(&self, id: &str) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE selection_marks
+             SET use_count = use_count + 1
+             WHERE id = ?1",
+            params![id],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn get_selection_mark(&self, id: &str) -> Result<Option<SelectionMark>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT id, text, source_app, created_at, use_count
+                 FROM selection_marks
+                 WHERE id = ?1",
+                params![id],
+                selection_mark_from_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    fn prune_selection_marks(&self, limit: usize) -> Result<(), StorageError> {
+        if limit == 0 {
+            self.connection.execute("DELETE FROM selection_marks", [])?;
+            return Ok(());
+        }
+
+        let count =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM selection_marks", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        let overflow = count - limit as i64;
+        if overflow <= 0 {
+            return Ok(());
+        }
+
+        self.connection.execute(
+            "DELETE FROM selection_marks
+             WHERE id IN (
+                SELECT id
+                FROM selection_marks
+                ORDER BY created_at ASC, rowid ASC
+                LIMIT ?1
+             )",
+            params![overflow],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_todos(
+        &self,
+        status: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<Vec<Todo>, StorageError> {
+        let status = normalize_todo_list_status(status).map_err(StorageError::Validation)?;
+        let query = query.unwrap_or_default().trim().to_lowercase();
+        let query_pattern = format!("%{}%", escape_like_query(&query));
+        let mut statement = self.connection.prepare(
+            "SELECT id, text, source_app, remind_at, status, last_notified_at, created_at, updated_at
+             FROM todos
+             WHERE (?1 = 'all' OR status = ?1)
+               AND (?2 = '' OR lower(text) LIKE ?3 ESCAPE '\\')
+             ORDER BY
+               CASE WHEN status = 'pending' AND remind_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now') THEN 0 ELSE 1 END ASC,
+               remind_at ASC,
+               created_at DESC",
+        )?;
+        let rows = statement.query_map(params![status, query, query_pattern], todo_from_row)?;
+
+        let mut todos = Vec::new();
+        for row in rows {
+            todos.push(row?);
+        }
+
+        Ok(todos)
+    }
+
+    pub fn save_todo(&self, input: TodoInput) -> Result<Todo, StorageError> {
+        let text = input.text.trim();
+        validate_todo_text(text).map_err(StorageError::Validation)?;
+        let remind_at =
+            parse_future_utc_time(&input.remind_at).map_err(StorageError::Validation)?;
+        let source_app = normalize_optional_text(input.source_app);
+        let id = generated_record_id("todo");
+
+        self.connection.execute(
+            "INSERT INTO todos (id, text, source_app, remind_at, status, last_notified_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![id, text, source_app, remind_at],
+        )?;
+
+        self.get_todo(&id)?
+            .ok_or_else(|| StorageError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn update_todo(&self, input: TodoUpdateInput) -> Result<Todo, StorageError> {
+        let id = input.id;
+        let existing = self
+            .get_todo(&id)?
+            .ok_or_else(|| StorageError::Validation("待办不存在".into()))?;
+        let text = input
+            .text
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(existing.text.as_str());
+        validate_todo_text(text).map_err(StorageError::Validation)?;
+        let remind_at = match input.remind_at.as_deref() {
+            Some(value) => parse_future_utc_time(value).map_err(StorageError::Validation)?,
+            None => existing.remind_at,
+        };
+
+        self.connection.execute(
+            "UPDATE todos
+             SET text = ?2,
+                 remind_at = ?3,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            params![id, text, remind_at],
+        )?;
+
+        self.get_todo(&id)?
+            .ok_or_else(|| StorageError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn complete_todo(&self, id: &str) -> Result<Todo, StorageError> {
+        self.connection.execute(
+            "UPDATE todos
+             SET status = 'done',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            params![id],
+        )?;
+
+        self.get_todo(id)?
+            .ok_or_else(|| StorageError::Validation("待办不存在".into()))
+    }
+
+    pub fn snooze_todo(&self, id: &str, minutes: i64) -> Result<Todo, StorageError> {
+        if !(1..=1440).contains(&minutes) {
+            return Err(StorageError::Validation(
+                "稍后提醒时间必须在 1 到 1440 分钟之间".into(),
+            ));
+        }
+        let remind_at = utc_time_string(Utc::now() + ChronoDuration::minutes(minutes));
+        self.connection.execute(
+            "UPDATE todos
+             SET remind_at = ?2,
+                 status = 'pending',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            params![id, remind_at],
+        )?;
+
+        self.get_todo(id)?
+            .ok_or_else(|| StorageError::Validation("待办不存在".into()))
+    }
+
+    pub fn delete_todo(&self, id: &str) -> Result<bool, StorageError> {
+        let affected = self
+            .connection
+            .execute("DELETE FROM todos WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
+    pub fn clear_completed_todos(&self) -> Result<usize, StorageError> {
+        let affected = self
+            .connection
+            .execute("DELETE FROM todos WHERE status = 'done'", [])?;
+        Ok(affected)
+    }
+
+    pub fn due_todos(&self, now: DateTime<Utc>) -> Result<Vec<Todo>, StorageError> {
+        let now = utc_time_string(now);
+        let mut statement = self.connection.prepare(
+            "SELECT id, text, source_app, remind_at, status, last_notified_at, created_at, updated_at
+             FROM todos
+             WHERE status = 'pending' AND remind_at <= ?1
+             ORDER BY remind_at ASC, created_at ASC",
+        )?;
+        let rows = statement.query_map(params![now], todo_from_row)?;
+
+        let mut todos = Vec::new();
+        for row in rows {
+            todos.push(row?);
+        }
+
+        Ok(todos)
+    }
+
+    pub fn mark_todo_notified(&self, id: &str) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE todos
+             SET last_notified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            params![id],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn get_todo(&self, id: &str) -> Result<Option<Todo>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT id, text, source_app, remind_at, status, last_notified_at, created_at, updated_at
+                 FROM todos
+                 WHERE id = ?1",
+                params![id],
+                todo_from_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
     }
 
     pub fn list_web_search_templates(&self) -> Result<Vec<WebSearchTemplate>, StorageError> {
@@ -1944,6 +2269,27 @@ fn initialize_schema(connection: &Connection) -> Result<(), StorageError> {
             use_count INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS selection_marks (
+            id TEXT PRIMARY KEY NOT NULL,
+            text TEXT NOT NULL,
+            source_app TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            use_count INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS todos (
+            id TEXT PRIMARY KEY NOT NULL,
+            text TEXT NOT NULL,
+            source_app TEXT,
+            remind_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'done')),
+            last_notified_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_todos_due ON todos(status, remind_at);
+
         CREATE TABLE IF NOT EXISTS web_search_templates (
             id TEXT PRIMARY KEY NOT NULL,
             keyword TEXT NOT NULL UNIQUE,
@@ -2162,6 +2508,29 @@ fn phrase_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Phrase> {
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
         use_count: row.get(5)?,
+    })
+}
+
+fn selection_mark_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SelectionMark> {
+    Ok(SelectionMark {
+        id: row.get(0)?,
+        text: row.get(1)?,
+        source_app: row.get(2)?,
+        created_at: row.get(3)?,
+        use_count: row.get(4)?,
+    })
+}
+
+fn todo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Todo> {
+    Ok(Todo {
+        id: row.get(0)?,
+        text: row.get(1)?,
+        source_app: row.get(2)?,
+        remind_at: row.get(3)?,
+        status: row.get(4)?,
+        last_notified_at: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -2385,6 +2754,87 @@ fn validate_phrase_fields(title: &str, text: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn validate_selection_mark_text(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("划词记录内容不能为空".into());
+    }
+    if text.chars().count() > SELECTION_MARK_TEXT_MAX_CHARS {
+        return Err(format!(
+            "划词记录内容不能超过 {} 个字符",
+            SELECTION_MARK_TEXT_MAX_CHARS
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_todo_text(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("待办内容不能为空".into());
+    }
+    if text.chars().count() > TODO_TEXT_MAX_CHARS {
+        return Err(format!("待办内容不能超过 {} 个字符", TODO_TEXT_MAX_CHARS));
+    }
+
+    Ok(())
+}
+
+fn parse_future_utc_time(value: &str) -> Result<String, String> {
+    let remind_at = parse_utc_time(value)?;
+    if remind_at <= Utc::now() {
+        return Err("提醒时间必须晚于当前时间".into());
+    }
+
+    Ok(utc_time_string(remind_at))
+}
+
+fn parse_utc_time(value: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| "提醒时间格式无效".into())
+}
+
+fn utc_time_string(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn normalize_todo_list_status(status: Option<&str>) -> Result<&'static str, String> {
+    match status
+        .unwrap_or("pending")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "pending" => Ok("pending"),
+        "done" => Ok("done"),
+        "all" => Ok("all"),
+        _ => Err("待办状态只能是 pending、done 或 all".into()),
+    }
+}
+
+fn escape_like_query(query: &str) -> String {
+    query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().chars().take(512).collect::<String>())
+        .filter(|value| !value.is_empty())
+}
+
+fn generated_record_id(prefix: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let mut rng = rand::rng();
+    let suffix: u32 = rand::Rng::random(&mut rng);
+    format!("{prefix}:{millis:x}-{suffix:08x}")
 }
 
 fn validate_web_search_template_fields(
@@ -3713,6 +4163,272 @@ mod tests {
                 text: "x".repeat(4001),
             })
             .is_err());
+    }
+
+    #[test]
+    fn selection_mark_crud_allows_duplicate_text_and_tracks_use_count() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage {
+            database_path: PathBuf::from("memory"),
+            connection,
+        };
+
+        let first = storage
+            .save_selection_mark(SelectionMarkInput {
+                text: "  same text  ".into(),
+                source_app: Some("  ".into()),
+            })
+            .expect("create first mark");
+        let second = storage
+            .save_selection_mark(SelectionMarkInput {
+                text: "same text".into(),
+                source_app: None,
+            })
+            .expect("create duplicate mark");
+
+        assert_ne!(first.id, second.id);
+        assert!(first.id.starts_with("mark:"));
+        assert_eq!(first.text, "same text");
+        assert_eq!(first.source_app, None);
+        assert_eq!(storage.list_selection_marks().expect("list marks").len(), 2);
+
+        storage
+            .mark_selection_mark_used(&first.id)
+            .expect("mark used");
+        assert_eq!(
+            storage
+                .get_selection_mark(&first.id)
+                .expect("get mark")
+                .expect("mark exists")
+                .use_count,
+            1
+        );
+        assert!(storage
+            .delete_selection_mark(&first.id)
+            .expect("delete mark"));
+        assert_eq!(storage.clear_selection_marks().expect("clear marks"), 1);
+        assert!(storage
+            .list_selection_marks()
+            .expect("list marks")
+            .is_empty());
+    }
+
+    #[test]
+    fn selection_mark_rejects_empty_and_too_long_text() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage {
+            database_path: PathBuf::from("memory"),
+            connection,
+        };
+
+        assert!(storage
+            .save_selection_mark(SelectionMarkInput {
+                text: "   ".into(),
+                source_app: None,
+            })
+            .is_err());
+        assert!(storage
+            .save_selection_mark(SelectionMarkInput {
+                text: "x".repeat(SELECTION_MARK_TEXT_MAX_CHARS + 1),
+                source_app: None,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn selection_mark_limit_prunes_oldest_records() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage {
+            database_path: PathBuf::from("memory"),
+            connection,
+        };
+
+        let first = storage
+            .save_selection_mark_with_limit(
+                SelectionMarkInput {
+                    text: "first".into(),
+                    source_app: None,
+                },
+                2,
+            )
+            .expect("create first");
+        let second = storage
+            .save_selection_mark_with_limit(
+                SelectionMarkInput {
+                    text: "second".into(),
+                    source_app: None,
+                },
+                2,
+            )
+            .expect("create second");
+        let third = storage
+            .save_selection_mark_with_limit(
+                SelectionMarkInput {
+                    text: "third".into(),
+                    source_app: None,
+                },
+                2,
+            )
+            .expect("create third");
+
+        let ids = storage
+            .list_selection_marks()
+            .expect("list marks")
+            .into_iter()
+            .map(|mark| mark.id)
+            .collect::<Vec<_>>();
+
+        assert!(!ids.contains(&first.id));
+        assert!(ids.contains(&second.id));
+        assert!(ids.contains(&third.id));
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn todo_crud_complete_snooze_delete_and_clear_completed() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage {
+            database_path: PathBuf::from("memory"),
+            connection,
+        };
+        let remind_at = utc_time_string(Utc::now() + ChronoDuration::hours(1));
+
+        let created = storage
+            .save_todo(TodoInput {
+                text: "  follow up  ".into(),
+                source_app: None,
+                remind_at,
+            })
+            .expect("create todo");
+
+        assert!(created.id.starts_with("todo:"));
+        assert_eq!(created.text, "follow up");
+        assert_eq!(created.status, "pending");
+        assert_eq!(
+            storage.list_todos(None, None).expect("list pending").len(),
+            1
+        );
+
+        let updated = storage
+            .update_todo(TodoUpdateInput {
+                id: created.id.clone(),
+                text: Some("follow up later".into()),
+                remind_at: Some(utc_time_string(Utc::now() + ChronoDuration::hours(2))),
+            })
+            .expect("update todo");
+        assert_eq!(updated.text, "follow up later");
+
+        let snoozed = storage.snooze_todo(&created.id, 10).expect("snooze todo");
+        assert_eq!(snoozed.status, "pending");
+
+        let completed = storage.complete_todo(&created.id).expect("complete todo");
+        assert_eq!(completed.status, "done");
+        assert_eq!(
+            storage
+                .clear_completed_todos()
+                .expect("clear completed todos"),
+            1
+        );
+        assert!(storage
+            .list_todos(Some("all"), None)
+            .expect("list all")
+            .is_empty());
+    }
+
+    #[test]
+    fn todo_rejects_invalid_fields() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage {
+            database_path: PathBuf::from("memory"),
+            connection,
+        };
+
+        assert!(storage
+            .save_todo(TodoInput {
+                text: " ".into(),
+                source_app: None,
+                remind_at: utc_time_string(Utc::now() + ChronoDuration::hours(1)),
+            })
+            .is_err());
+        assert!(storage
+            .save_todo(TodoInput {
+                text: "x".repeat(TODO_TEXT_MAX_CHARS + 1),
+                source_app: None,
+                remind_at: utc_time_string(Utc::now() + ChronoDuration::hours(1)),
+            })
+            .is_err());
+        assert!(storage
+            .save_todo(TodoInput {
+                text: "todo".into(),
+                source_app: None,
+                remind_at: "not-a-time".into(),
+            })
+            .is_err());
+        assert!(storage
+            .save_todo(TodoInput {
+                text: "todo".into(),
+                source_app: None,
+                remind_at: utc_time_string(Utc::now() - ChronoDuration::minutes(1)),
+            })
+            .is_err());
+        assert!(storage
+            .connection
+            .execute(
+                "INSERT INTO todos (id, text, remind_at, status)
+                 VALUES ('todo:bad-status', 'todo', '2999-06-01T00:00:00.000Z', 'bad')",
+                [],
+            )
+            .is_err());
+        assert!(storage.list_todos(Some("bad"), None).is_err());
+        assert!(storage.snooze_todo("todo:missing", 0).is_err());
+    }
+
+    #[test]
+    fn todo_due_query_returns_only_pending_due_items_and_index_exists() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage {
+            database_path: PathBuf::from("memory"),
+            connection,
+        };
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO todos (id, text, remind_at, status, created_at, updated_at)
+                 VALUES
+                 ('todo:due', 'due alpha', '2026-06-01T00:00:00.000Z', 'pending', '2026-06-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z'),
+                 ('todo:future', 'future beta', '2026-06-03T00:00:00.000Z', 'pending', '2026-06-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z'),
+                 ('todo:done', 'done alpha', '2026-06-01T00:00:00.000Z', 'done', '2026-06-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z')",
+                [],
+            )
+            .expect("seed todos");
+
+        let due = storage
+            .due_todos(parse_utc_time("2026-06-02T00:00:00.000Z").expect("parse now"))
+            .expect("due todos");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, "todo:due");
+
+        let filtered = storage
+            .list_todos(Some("all"), Some("alpha"))
+            .expect("filter todos");
+        assert_eq!(filtered.len(), 2);
+
+        let index_exists: i64 = storage
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_todos_due'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query index");
+        assert_eq!(index_exists, 1);
     }
 
     #[test]

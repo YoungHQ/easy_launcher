@@ -20,6 +20,7 @@ use ai::{
     AiConfig, AiRequest,
 };
 use apps::{launch_app, warm_app_scan_cache};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clipboard_win::set_clipboard_string;
 use everything::{detect_everything_status, EverythingStatus};
 use process::hidden_command;
@@ -27,13 +28,14 @@ use search::{
     apply_action_keyword_route, cached_search_diagnostics, default_search_core,
     log_search_diagnostics, merge_ranked_results, parse_action_keyword_query,
     parse_quick_entry_query, quick_entry_results, quick_entry_results_with_recents, ActionKind,
-    CachedSearchResults, EverythingSearchOptions, ProviderTier, SearchContext, SearchDiagnostics,
-    SearchResult, SearchResultCache, SearchSource,
+    CachedSearchResults, EverythingSearchOptions, ProviderTier, QuickEntryCategory,
+    QuickEntryRoute, SearchContext, SearchDiagnostics, SearchResult, SearchResultCache,
+    SearchSource,
 };
 use selection::{capture_selected_text, SelectionCaptureResult};
 use selection_trigger::{SelectionTriggerHandle, SELECTION_TRIGGER_MODE_CTRL_MOUSE};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,14 +47,15 @@ use storage::{
     AiModelProfile, AiModelProfileInput, AiProvider, AiProviderInput, AiProviderModel,
     AiProviderModelInput, AiSelectionAction, AiSelectionActionInput, CustomCommand,
     CustomCommandInput, ExclusionRule, ExclusionRuleInput, Phrase, PhraseInput, PinnedResult,
-    PinnedResultInput, ResultAlias, ResultAliasInput, WebSearchTemplate, WebSearchTemplateInput,
+    PinnedResultInput, ResultAlias, ResultAliasInput, SelectionMark, SelectionMarkInput, Todo,
+    TodoInput, TodoUpdateInput, WebSearchTemplate, WebSearchTemplateInput,
     TRANSLATION_AI_ASSISTANT_ID,
 };
 use storage::{Storage, StorageState, StorageStatus};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
-use tauri::{PhysicalPosition, PhysicalSize};
+use tauri::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tools::{sanitize_password_options, PasswordOptions};
 use updates::UpdateCheckResult;
@@ -70,6 +73,7 @@ const AI_CHAT_CANCELLED_EVENT: &str = "ai-chat-cancelled";
 const SETTINGS_OPENED_EVENT: &str = "settings-opened";
 const SEARCH_PROGRESS_EVENT: &str = "search-progress";
 const SEARCH_ICONS_UPDATED_EVENT: &str = "search-icons-updated";
+const TODO_REMINDER_EVENT: &str = "todo-reminder";
 const TRAY_OPEN_SETTINGS_EVENT: &str = "tray-open-settings";
 const TRAY_EVERYTHING_STATUS_EVENT: &str = "tray-everything-status";
 const TRAY_MENU_OPEN: &str = "tray-open-main";
@@ -89,9 +93,13 @@ const SETTINGS_WINDOW_HEIGHT: u32 = 700;
 const AI_WINDOW_WIDTH: u32 = 760;
 const AI_WINDOW_HEIGHT: u32 = 640;
 const SELECTION_PICKER_WINDOW_WIDTH: u32 = 520;
-const SELECTION_PICKER_WINDOW_HEIGHT: u32 = 48;
+const SELECTION_PICKER_WINDOW_HEIGHT: u32 = 52;
 const SELECTION_RESULT_WINDOW_WIDTH: u32 = 520;
 const SELECTION_RESULT_WINDOW_HEIGHT: u32 = 420;
+const REMINDER_WINDOW_WIDTH: u32 = 380;
+const REMINDER_WINDOW_HEIGHT: u32 = 190;
+const TODO_REMINDER_POLL_SECONDS: u64 = 25;
+const TODO_REMINDER_SNOOZE_MINUTES: i64 = 10;
 const DEFAULT_TOOL_MENU_ALIAS: &str = "/";
 const DEFAULT_SLASH_BOARD_SCOPE_SETTINGS: &str = r#"[{"id":"all","visible":true},{"id":"run","visible":true},{"id":"text","visible":true},{"id":"web","visible":true},{"id":"tools","visible":true},{"id":"recent","visible":true},{"id":"open","visible":true},{"id":"system","visible":true}]"#;
 const SLASH_BOARD_SCOPE_IDS: [&str; 8] = [
@@ -157,6 +165,13 @@ pub struct SelectionCaptureEvent {
     y: Option<i32>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoReminderPayload {
+    todo: Todo,
+    overdue: bool,
+}
+
 type ShortcutStatusStore = Mutex<ShortcutStatus>;
 
 struct AiShortcutStatusStore(Mutex<ShortcutStatus>);
@@ -167,6 +182,55 @@ type SearchResultCacheStore = Arc<Mutex<SearchResultCache>>;
 type LauncherWindowPositionStore = Mutex<Option<PhysicalPosition<i32>>>;
 type SettingsPanelOpenStore = Arc<AtomicBool>;
 type SelectionCaptureStore = Arc<Mutex<Option<SelectionCaptureEvent>>>;
+type TodoReminderStore = Arc<Mutex<TodoReminderRuntimeState>>;
+
+#[derive(Default)]
+struct TodoReminderRuntimeState {
+    queue: VecDeque<TodoReminderPayload>,
+    current: Option<TodoReminderPayload>,
+    active_ids: HashSet<String>,
+}
+
+impl TodoReminderRuntimeState {
+    fn enqueue_due(&mut self, todos: Vec<Todo>, now: DateTime<Utc>) -> usize {
+        let mut added = 0;
+        for todo in todos {
+            if !self.active_ids.insert(todo.id.clone()) {
+                continue;
+            }
+            let overdue = parse_utc_time(&todo.remind_at)
+                .map(|remind_at| remind_at < now - ChronoDuration::minutes(1))
+                .unwrap_or(false);
+            self.queue.push_back(TodoReminderPayload { todo, overdue });
+            added += 1;
+        }
+        added
+    }
+
+    fn promote_next(&mut self) -> Option<TodoReminderPayload> {
+        if self.current.is_none() {
+            self.current = self.queue.pop_front();
+        }
+        self.current.clone()
+    }
+
+    fn finish(&mut self, id: &str) -> bool {
+        let mut changed = false;
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|payload| payload.todo.id == id)
+        {
+            self.current = None;
+            changed = true;
+        }
+        let before_len = self.queue.len();
+        self.queue.retain(|payload| payload.todo.id != id);
+        changed |= before_len != self.queue.len();
+        changed |= self.active_ids.remove(id);
+        changed
+    }
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -646,6 +710,158 @@ fn delete_phrase(id: String, storage: tauri::State<'_, StorageState>) -> Result<
         .map_err(|_| "无法删除快捷短语".to_string())?
         .delete_phrase(&id)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_selection_marks(
+    storage: tauri::State<'_, StorageState>,
+) -> Result<Vec<SelectionMark>, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法读取划词记录".to_string())?
+        .list_selection_marks()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_selection_mark(
+    input: SelectionMarkInput,
+    storage: tauri::State<'_, StorageState>,
+) -> Result<SelectionMark, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法保存划词记录".to_string())?
+        .save_selection_mark(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_selection_mark(
+    id: String,
+    storage: tauri::State<'_, StorageState>,
+) -> Result<bool, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法删除划词记录".to_string())?
+        .delete_selection_mark(&id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_selection_marks(storage: tauri::State<'_, StorageState>) -> Result<usize, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法清空划词记录".to_string())?
+        .clear_selection_marks()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_todos(
+    status: Option<String>,
+    query: Option<String>,
+    storage: tauri::State<'_, StorageState>,
+) -> Result<Vec<Todo>, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法读取待办".to_string())?
+        .list_todos(status.as_deref(), query.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_todo(input: TodoInput, storage: tauri::State<'_, StorageState>) -> Result<Todo, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法保存待办".to_string())?
+        .save_todo(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_todo(
+    input: TodoUpdateInput,
+    app: AppHandle,
+    storage: tauri::State<'_, StorageState>,
+    reminders: tauri::State<'_, TodoReminderStore>,
+) -> Result<Todo, String> {
+    let updated = storage
+        .lock()
+        .map_err(|_| "无法更新待办".to_string())?
+        .update_todo(input)
+        .map_err(|error| error.to_string())?;
+    finish_todo_reminder(&app, reminders.inner(), &updated.id, true);
+    Ok(updated)
+}
+
+#[tauri::command]
+fn complete_todo(
+    id: String,
+    app: AppHandle,
+    storage: tauri::State<'_, StorageState>,
+    reminders: tauri::State<'_, TodoReminderStore>,
+) -> Result<Todo, String> {
+    let todo = storage
+        .lock()
+        .map_err(|_| "无法完成待办".to_string())?
+        .complete_todo(&id)
+        .map_err(|error| error.to_string())?;
+    finish_todo_reminder(&app, reminders.inner(), &id, true);
+    Ok(todo)
+}
+
+#[tauri::command]
+fn snooze_todo(
+    id: String,
+    minutes: i64,
+    app: AppHandle,
+    storage: tauri::State<'_, StorageState>,
+    reminders: tauri::State<'_, TodoReminderStore>,
+) -> Result<Todo, String> {
+    let todo = storage
+        .lock()
+        .map_err(|_| "无法稍后提醒".to_string())?
+        .snooze_todo(&id, minutes)
+        .map_err(|error| error.to_string())?;
+    finish_todo_reminder(&app, reminders.inner(), &id, true);
+    Ok(todo)
+}
+
+#[tauri::command]
+fn delete_todo(
+    id: String,
+    app: AppHandle,
+    storage: tauri::State<'_, StorageState>,
+    reminders: tauri::State<'_, TodoReminderStore>,
+) -> Result<bool, String> {
+    let deleted = storage
+        .lock()
+        .map_err(|_| "无法删除待办".to_string())?
+        .delete_todo(&id)
+        .map_err(|error| error.to_string())?;
+    if deleted {
+        finish_todo_reminder(&app, reminders.inner(), &id, true);
+    }
+    Ok(deleted)
+}
+
+#[tauri::command]
+fn clear_completed_todos(storage: tauri::State<'_, StorageState>) -> Result<usize, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法清空已完成待办".to_string())?
+        .clear_completed_todos()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_pending_todo_reminder(
+    reminders: tauri::State<'_, TodoReminderStore>,
+) -> Option<TodoReminderPayload> {
+    reminders
+        .lock()
+        .ok()
+        .and_then(|state| state.current.clone())
 }
 
 #[tauri::command]
@@ -1992,6 +2208,8 @@ fn search(query: String) -> Vec<SearchResult> {
         result_aliases: None,
         custom_commands: None,
         phrases: None,
+        selection_marks: None,
+        todos: None,
         web_search_templates: None,
         password_options: Some(&password_options),
         exclusion_rules: None,
@@ -2074,9 +2292,12 @@ fn search_with_recents_blocking(
         tool_menu_alias,
         custom_commands,
         phrases,
+        selection_marks,
+        todos,
         web_search_templates,
         recent_items,
         exclusion_rules,
+        quick_entry_route,
     ) = {
         let storage = storage.lock().map_err(|_| "无法读取搜索数据".to_string())?;
 
@@ -2105,6 +2326,7 @@ fn search_with_recents_blocking(
         let everything_options = read_everything_search_options(&storage)?;
         let password_options = read_password_options(&storage)?;
         let tool_menu_alias = read_tool_menu_alias(&storage)?;
+        let quick_entry_route = parse_quick_entry_query(&query, &tool_menu_alias);
         let custom_commands = if search_source_settings.system {
             storage
                 .list_custom_commands()
@@ -2114,6 +2336,32 @@ fn search_with_recents_blocking(
         };
         let phrases = if search_source_settings.phrase {
             storage.list_phrases().map_err(|error| error.to_string())?
+        } else {
+            Vec::new()
+        };
+        let selection_marks = if matches!(
+            quick_entry_route.as_ref(),
+            Some(QuickEntryRoute::Category {
+                category: QuickEntryCategory::Mark,
+                ..
+            })
+        ) {
+            storage
+                .list_selection_marks()
+                .map_err(|error| error.to_string())?
+        } else {
+            Vec::new()
+        };
+        let todos = if matches!(
+            quick_entry_route.as_ref(),
+            Some(QuickEntryRoute::Category {
+                category: QuickEntryCategory::Todo,
+                ..
+            })
+        ) {
+            storage
+                .list_todos(Some("all"), None)
+                .map_err(|error| error.to_string())?
         } else {
             Vec::new()
         };
@@ -2143,9 +2391,12 @@ fn search_with_recents_blocking(
             tool_menu_alias,
             custom_commands,
             phrases,
+            selection_marks,
+            todos,
             web_search_templates,
             recent_items,
             exclusion_rules,
+            quick_entry_route,
         )
     };
 
@@ -2158,9 +2409,9 @@ fn search_with_recents_blocking(
         &route,
     );
     let source_weights = source_weights_from_settings(&search_weight_settings);
-    if let Some(quick_entry_route) = parse_quick_entry_query(&query, &tool_menu_alias) {
+    if let Some(quick_entry_route) = quick_entry_route.as_ref() {
         let results = quick_entry_results_with_recents(
-            &quick_entry_route,
+            quick_entry_route,
             &SearchContext {
                 recent_scores: Some(&recent_scores),
                 query_selection_scores: Some(&query_selection_scores),
@@ -2168,6 +2419,8 @@ fn search_with_recents_blocking(
                 result_aliases: Some(&result_aliases),
                 custom_commands: Some(&custom_commands),
                 phrases: Some(&phrases),
+                selection_marks: Some(&selection_marks),
+                todos: Some(&todos),
                 web_search_templates: Some(&web_search_templates),
                 password_options: Some(&password_options),
                 exclusion_rules: Some(&exclusion_rules),
@@ -2214,6 +2467,8 @@ fn search_with_recents_blocking(
                 result_aliases: Some(&result_aliases),
                 custom_commands: Some(&custom_commands),
                 phrases: Some(&phrases),
+                selection_marks: None,
+                todos: None,
                 web_search_templates: Some(&web_search_templates),
                 password_options: Some(&password_options),
                 exclusion_rules: Some(&exclusion_rules),
@@ -2241,6 +2496,8 @@ fn search_with_recents_blocking(
                 result_aliases: Some(&result_aliases),
                 custom_commands: Some(&custom_commands),
                 phrases: Some(&phrases),
+                selection_marks: None,
+                todos: None,
                 web_search_templates: Some(&web_search_templates),
                 password_options: Some(&password_options),
                 exclusion_rules: Some(&exclusion_rules),
@@ -2362,6 +2619,8 @@ fn search_with_recents_blocking(
             result_aliases: Some(&result_aliases),
             custom_commands: Some(&custom_commands),
             phrases: Some(&phrases),
+            selection_marks: None,
+            todos: None,
             web_search_templates: Some(&web_search_templates),
             password_options: Some(&password_options),
             exclusion_rules: Some(&exclusion_rules),
@@ -2442,6 +2701,8 @@ fn run_complete_search_with_cache(
             result_aliases: Some(&result_aliases),
             custom_commands: Some(&custom_commands),
             phrases: Some(&phrases),
+            selection_marks: None,
+            todos: None,
             web_search_templates: Some(&web_search_templates),
             password_options: Some(&password_options),
             exclusion_rules: Some(&exclusion_rules),
@@ -2503,6 +2764,8 @@ fn spawn_slow_search_progress(
                 result_aliases: Some(&result_aliases),
                 custom_commands: Some(&custom_commands),
                 phrases: Some(&phrases),
+                selection_marks: None,
+                todos: None,
                 web_search_templates: Some(&web_search_templates),
                 password_options: Some(&password_options),
                 exclusion_rules: Some(&exclusion_rules),
@@ -2892,6 +3155,13 @@ fn execute_result(
                     .lock()
                     .map_err(|_| "无法记录快捷短语使用".to_string())?
                     .mark_phrase_used(&result.id)
+                    .map_err(|error| error.to_string())?;
+            }
+            if result.id.starts_with("mark:") {
+                storage
+                    .lock()
+                    .map_err(|_| "无法记录划词记录使用".to_string())?
+                    .mark_selection_mark_used(&result.id)
                     .map_err(|error| error.to_string())?;
             }
             Ok(())
@@ -3743,6 +4013,12 @@ fn current_timestamp() -> String {
     format!("{seconds}")
 }
 
+fn parse_utc_time(value: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| "时间格式无效".into())
+}
+
 #[tauri::command]
 fn open_everything_download() -> Result<(), String> {
     hidden_command("cmd")
@@ -4233,9 +4509,9 @@ fn show_selection_window(app: &AppHandle, point: Option<(i32, i32)>) {
         }
     };
     disable_native_window_frame(&window);
-    let _ = window.set_size(PhysicalSize::new(
-        SELECTION_PICKER_WINDOW_WIDTH,
-        SELECTION_PICKER_WINDOW_HEIGHT,
+    let _ = window.set_size(LogicalSize::new(
+        SELECTION_PICKER_WINDOW_WIDTH as f64,
+        SELECTION_PICKER_WINDOW_HEIGHT as f64,
     ));
     let _ = window.set_position(selection_window_position(app, point));
     let _ = window.set_always_on_top(true);
@@ -4409,6 +4685,153 @@ pub fn emit_selection_capture(app: &AppHandle, point: Option<(i32, i32)>) {
     }
 }
 
+fn start_todo_reminder_scheduler(
+    app: AppHandle,
+    storage: StorageState,
+    reminders: TodoReminderStore,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            scan_due_todo_reminders(&app, &storage, &reminders);
+            tokio::time::sleep(Duration::from_secs(TODO_REMINDER_POLL_SECONDS)).await;
+        }
+    });
+}
+
+fn scan_due_todo_reminders(app: &AppHandle, storage: &StorageState, reminders: &TodoReminderStore) {
+    let now = Utc::now();
+    let due_todos = storage
+        .lock()
+        .ok()
+        .and_then(|storage| storage.due_todos(now).ok())
+        .unwrap_or_default();
+    if due_todos.is_empty() {
+        return;
+    }
+
+    let should_show = reminders
+        .lock()
+        .map(|mut state| {
+            let added = state.enqueue_due(due_todos, now);
+            added > 0 && state.current.is_none()
+        })
+        .unwrap_or(false);
+    if should_show {
+        show_next_todo_reminder(app, storage, reminders);
+    }
+}
+
+fn show_next_todo_reminder(app: &AppHandle, storage: &StorageState, reminders: &TodoReminderStore) {
+    let payload = reminders
+        .lock()
+        .ok()
+        .and_then(|mut state| state.promote_next());
+    let Some(payload) = payload else {
+        if let Some(window) = app.get_webview_window("reminder") {
+            let _ = window.hide();
+        }
+        return;
+    };
+
+    if let Ok(storage) = storage.lock() {
+        let _ = storage.mark_todo_notified(&payload.todo.id);
+    }
+    show_reminder_window(app);
+    if let Some(window) = app.get_webview_window("reminder") {
+        let _ = window.emit(TODO_REMINDER_EVENT, payload);
+    }
+}
+
+fn finish_todo_reminder(app: &AppHandle, reminders: &TodoReminderStore, id: &str, show_next: bool) {
+    let changed = reminders
+        .lock()
+        .map(|mut state| state.finish(id))
+        .unwrap_or(false);
+    if !changed {
+        return;
+    }
+
+    if let Some(storage) = app.try_state::<StorageState>() {
+        if show_next {
+            show_next_todo_reminder(app, storage.inner(), reminders);
+        } else if let Some(window) = app.get_webview_window("reminder") {
+            let _ = window.hide();
+        }
+    }
+}
+
+fn snooze_current_todo_reminder(app: &AppHandle) {
+    let Some(reminders) = app.try_state::<TodoReminderStore>() else {
+        return;
+    };
+    let Some(storage) = app.try_state::<StorageState>() else {
+        return;
+    };
+    let current_id = reminders.lock().ok().and_then(|state| {
+        state
+            .current
+            .as_ref()
+            .map(|payload| payload.todo.id.clone())
+    });
+    let Some(current_id) = current_id else {
+        return;
+    };
+    if let Ok(storage) = storage.lock() {
+        let _ = storage.snooze_todo(&current_id, TODO_REMINDER_SNOOZE_MINUTES);
+    }
+    finish_todo_reminder(app, reminders.inner(), &current_id, true);
+}
+
+fn show_reminder_window(app: &AppHandle) {
+    let window = if let Some(window) = app.get_webview_window("reminder") {
+        window
+    } else {
+        match WebviewWindowBuilder::new(app, "reminder", WebviewUrl::App("index.html".into()))
+            .title("Easy Launcher Reminder")
+            .inner_size(REMINDER_WINDOW_WIDTH as f64, REMINDER_WINDOW_HEIGHT as f64)
+            .resizable(false)
+            .decorations(false)
+            .transparent(true)
+            .shadow(false)
+            .skip_taskbar(true)
+            .always_on_top(true)
+            .build()
+        {
+            Ok(window) => window,
+            Err(_) => return,
+        }
+    };
+    disable_native_window_frame(&window);
+    let _ = window.set_size(LogicalSize::new(
+        REMINDER_WINDOW_WIDTH as f64,
+        REMINDER_WINDOW_HEIGHT as f64,
+    ));
+    let _ = window.set_position(reminder_window_position(app));
+    let _ = window.set_always_on_top(true);
+    disable_native_window_frame(&window);
+    let _ = window.show();
+    disable_native_window_frame(&window);
+    let _ = window.set_focus();
+}
+
+fn reminder_window_position(app: &AppHandle) -> PhysicalPosition<i32> {
+    let margin_x = 24;
+    let margin_y = 64;
+    if let Ok(monitors) = app.available_monitors() {
+        if let Some(monitor) = monitors.first() {
+            let position = monitor.position();
+            let size = monitor.size();
+            let scale_factor = monitor.scale_factor();
+            let window_width = (REMINDER_WINDOW_WIDTH as f64 * scale_factor).round() as i32;
+            let window_height = (REMINDER_WINDOW_HEIGHT as f64 * scale_factor).round() as i32;
+            let x = position.x + size.width as i32 - window_width - margin_x;
+            let y = position.y + size.height as i32 - window_height - margin_y;
+            return PhysicalPosition::new(x.max(position.x), y.max(position.y));
+        }
+    }
+    PhysicalPosition::new(120, 120)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -4447,6 +4870,15 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
+            if window.label() == "reminder" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let app = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        snooze_current_todo_reminder(&app);
+                    });
+                }
+            }
         })
         .setup(|app| {
             let storage = Storage::initialize().map_err(|error| error.to_string())?;
@@ -4460,6 +4892,13 @@ pub fn run() {
                 .unwrap_or_else(|| AI_SHORTCUT_LABEL.into());
             let storage = Arc::new(Mutex::new(storage));
             app.manage(storage);
+            let todo_reminders = Arc::new(Mutex::new(TodoReminderRuntimeState::default()));
+            app.manage(todo_reminders.clone());
+            start_todo_reminder_scheduler(
+                app.handle().clone(),
+                app.state::<StorageState>().inner().clone(),
+                todo_reminders,
+            );
             let selection_trigger = SelectionTriggerHandle::start(
                 app.handle().clone(),
                 app.state::<StorageState>().inner().clone(),
@@ -4619,6 +5058,18 @@ pub fn run() {
             list_phrases,
             save_phrase,
             delete_phrase,
+            list_selection_marks,
+            save_selection_mark,
+            delete_selection_mark,
+            clear_selection_marks,
+            list_todos,
+            save_todo,
+            update_todo,
+            complete_todo,
+            snooze_todo,
+            delete_todo,
+            clear_completed_todos,
+            get_pending_todo_reminder,
             list_web_search_templates,
             save_web_search_template,
             delete_web_search_template,
@@ -4762,6 +5213,8 @@ mod tests {
 
         assert!(json.contains("customCommands"));
         assert!(json.contains("https://example.com"));
+        assert!(!json.contains("selectionMarks"));
+        assert!(!json.contains("todos"));
         assert!(!json.contains("ai.api_key"));
     }
 
@@ -4964,6 +5417,30 @@ mod tests {
     }
 
     #[test]
+    fn todo_reminder_runtime_dedupes_and_advances_queue() {
+        let mut state = TodoReminderRuntimeState::default();
+        let now = parse_utc_time("2026-06-02T00:00:00.000Z").expect("parse now");
+        let todo = Todo {
+            id: "todo:one".into(),
+            text: "one".into(),
+            source_app: None,
+            remind_at: "2026-06-01T23:00:00.000Z".into(),
+            status: "pending".into(),
+            last_notified_at: None,
+            created_at: "2026-06-01T00:00:00.000Z".into(),
+            updated_at: "2026-06-01T00:00:00.000Z".into(),
+        };
+
+        assert_eq!(state.enqueue_due(vec![todo.clone()], now), 1);
+        assert_eq!(state.enqueue_due(vec![todo], now), 0);
+        let current = state.promote_next().expect("promote first");
+        assert_eq!(current.todo.id, "todo:one");
+        assert!(current.overdue);
+        assert!(state.finish("todo:one"));
+        assert!(state.promote_next().is_none());
+    }
+
+    #[test]
     fn search_cache_key_changes_when_local_search_inputs_change() {
         let source_settings = SearchSourceSettings {
             apps: true,
@@ -5156,6 +5633,8 @@ mod tests {
         assert!(json.contains("phrases"));
         assert!(json.contains("exclusionRules"));
         assert!(json.contains("search.weight.apps"));
+        assert!(!json.contains("selectionMarks"));
+        assert!(!json.contains("todos"));
         assert!(!json.contains("ai.api_key"));
     }
 

@@ -1079,23 +1079,23 @@ button {
 }
 
 .selectionAssistantShell.picker {
-  place-items: stretch;
+  place-items: start stretch;
 }
 
 .selectionPickerPanel {
   position: relative;
   width: 100%;
-  height: 100%;
+  min-height: 52px;
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 30px;
-  align-items: start;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
   gap: 6px;
   overflow: visible;
   border: 1px solid rgba(41, 57, 74, 0.13);
   border-radius: 8px;
   background: var(--color-background);
-  padding: 7px;
+  padding: 7px 32px 7px 7px;
   box-shadow:
     0 12px 28px rgba(41, 57, 74, 0.16),
     0 2px 7px rgba(41, 57, 74, 0.08);
@@ -1128,12 +1128,29 @@ button {
   white-space: nowrap;
 }
 
+.selectionPickerActions button.selectionPickerIconAction {
+  width: 30px;
+  flex: 0 0 30px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text);
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+
 .selectionPickerActions button:hover,
 .selectionPickerActions button:focus-visible,
 .selectionPickerClose:hover,
 .selectionMoreMenu button:hover {
   background: var(--color-accent);
   color: var(--color-panel);
+}
+
+.selectionPickerActions button.selectionPickerIconAction:hover,
+.selectionPickerActions button.selectionPickerIconAction:focus-visible {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
 }
 
 .selectionPickerActions button:disabled,
@@ -1143,8 +1160,51 @@ button {
 }
 
 .selectionPickerClose {
-  width: 30px;
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #536172;
   padding: 0;
+}
+
+.selectionPickerClose:hover,
+.selectionPickerClose:focus-visible {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
+.selectionPickerIconSvg,
+.selectionPickerCloseIcon {
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.selectionPickerIconSvg {
+  width: 22px;
+  height: 22px;
+  stroke-width: 1.75;
+}
+
+.selectionPickerCloseIcon {
+  width: 15px;
+  height: 15px;
+  stroke-width: 2.3;
+}
+
+.selectionPickerIconSvg,
+.selectionPickerCloseIcon {
+  pointer-events: none;
 }
 
 .selectionPickerStatus {
@@ -1169,28 +1229,212 @@ button {
 
 .selectionMoreMenu {
   position: absolute;
-  top: 38px;
+  top: 36px;
   right: 0;
   z-index: 3;
-  width: 168px;
+  width: 158px;
   max-height: 186px;
   display: grid;
-  gap: 4px;
+  gap: 2px;
   overflow: auto;
   border: 1px solid var(--color-border);
   border-radius: 7px;
   background: var(--color-background);
-  padding: 5px;
+  padding: 4px;
   box-shadow:
-    0 14px 30px rgba(41, 57, 74, 0.18),
-    0 2px 8px rgba(41, 57, 74, 0.08);
+    0 10px 24px rgba(41, 57, 74, 0.16),
+    0 2px 7px rgba(41, 57, 74, 0.08);
+  transform-origin: top right;
+  animation: selectionMenuDrop 110ms ease-out;
 }
 
 .selectionMoreMenu button {
   width: 100%;
+  min-height: 28px;
   justify-content: flex-start;
-  padding: 0 9px;
+  border: 0;
+  background: transparent;
+  padding: 0 8px;
   text-align: left;
+}
+
+.selectionMoreMenu button:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
+@keyframes selectionMenuDrop {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.selectionAssistantShell.todoTime,
+.reminderShell {
+  place-items: stretch;
+}
+
+.selectionTodoPanel,
+.reminderPanel {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(41, 57, 74, 0.13);
+  border-radius: 8px;
+  background: var(--color-background);
+  color: var(--color-text);
+  box-shadow:
+    0 14px 30px rgba(41, 57, 74, 0.16),
+    0 2px 8px rgba(41, 57, 74, 0.08);
+}
+
+.selectionTodoPanel {
+  grid-template-rows: auto 1fr auto auto;
+  padding: 12px;
+}
+
+.selectionTodoHeader,
+.selectionTodoFooter,
+.reminderHeader,
+.reminderPanel footer {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.selectionTodoHeader span,
+.reminderHeader span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.selectionTodoHeader strong,
+.reminderHeader strong {
+  color: var(--color-text);
+  font-size: 13px;
+}
+
+.selectionTodoHeader small,
+.reminderHeader small,
+.selectionTodoFooter span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-muted-text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selectionTodoHeader button,
+.selectionTodoFooter button,
+.reminderPanel button {
+  min-height: 30px;
+  border-radius: 6px;
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.selectionTodoHeader button:hover,
+.selectionTodoFooter button:hover,
+.reminderPanel button:hover {
+  background: var(--color-accent);
+  color: var(--color-panel);
+}
+
+.selectionTodoPresets {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.selectionTodoPresets button {
+  min-width: 0;
+  min-height: 48px;
+  display: grid;
+  align-content: center;
+  gap: 2px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-panel);
+  color: var(--color-text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.selectionTodoPresets button.active {
+  border-color: rgba(99, 139, 195, 0.58);
+  background: var(--color-accent-soft);
+}
+
+.selectionTodoPresets strong,
+.selectionTodoPresets small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selectionTodoPresets strong {
+  font-size: 12px;
+}
+
+.selectionTodoPresets small {
+  color: var(--color-muted-text);
+  font-size: 10px;
+}
+
+.selectionTodoCustom {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.selectionTodoCustom input {
+  min-height: 30px;
+  border-radius: 6px;
+  background: var(--color-panel);
+  color: var(--color-text);
+  font-size: 12px;
+}
+
+.reminderShell {
+  width: 100%;
+  height: 100dvh;
+  display: grid;
+  overflow: hidden;
+  background: transparent;
+}
+
+.reminderPanel {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  padding: 14px;
+}
+
+.reminderPanel p {
+  min-width: 0;
+  margin: 0;
+  overflow: auto;
+  color: var(--color-text);
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.reminderPanel footer {
+  justify-content: flex-end;
 }
 
 .selectionAssistantPanel {

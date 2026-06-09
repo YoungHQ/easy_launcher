@@ -63,7 +63,9 @@ const checks = [
     file: "src/App.tsx",
     label: "selection assistant stays in the dedicated window flow",
     patterns: [
-      'getCurrentWindow().label === "selection" ? <SelectionAssistantApp /> : <MainApp />',
+      'if (label === "selection")',
+      'if (label === "reminder")',
+      "return <TodoReminderApp />",
       "selectionAssistantShell picker",
       "selectionAssistantShell result",
       "list_visible_ai_selection_actions",

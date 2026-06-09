@@ -408,11 +408,11 @@
             </div>
             <div class="info-card">
               <strong>划词 AI</strong>
-              <span>按住 Ctrl 用鼠标划词，松开后呼出 AI 小对话框，可直接翻译、总结、解释和润色。</span>
+              <span>按住 Ctrl 用鼠标划词，松开后呼出小浮条，可记录原文、加入待办，或继续翻译、总结、解释和润色。</span>
             </div>
             <div class="info-card">
               <strong>Slash Board</strong>
-              <span>输入 Alias 打开两列快捷入口，可聚合命令、短语、网页模板、工具和最近打开。</span>
+              <span>输入 Alias 打开两列快捷入口，可聚合命令、短语、划词记录、待办、网页模板、工具和最近打开。</span>
             </div>
             <div class="info-card">
               <strong>桌面集成</strong>
@@ -530,7 +530,7 @@
               </tr>
               <tr>
                 <td>快捷入口 Alias</td>
-                <td><code>/</code>、<code>/cmd</code>、<code>/phrase</code>、<code>/web</code>、<code>/tools</code></td>
+                <td><code>/</code>、<code>/cmd</code>、<code>/phrase</code>、<code>/mark</code>、<code>/todo</code>、<code>/web</code>、<code>/tools</code></td>
                 <td>输入 Alias 本身打开 Slash Board；进入工具后继续保留 Alias，例如 <code>/tools enc </code>。</td>
               </tr>
               <tr>
@@ -589,6 +589,16 @@
                 <td>空输入展示全部短语，继续输入可按标题和内容过滤。</td>
               </tr>
               <tr>
+                <td><code>/mark</code></td>
+                <td>划词记录</td>
+                <td>只展示通过划词浮条保存的原文记录，不进入普通搜索；可打开、复制或删除。</td>
+              </tr>
+              <tr>
+                <td><code>/todo</code></td>
+                <td>待办提醒</td>
+                <td>集中管理划词加入的待办，支持完成、稍后、修改提醒时间、修改内容和删除。</td>
+              </tr>
+              <tr>
                 <td><code>/web</code></td>
                 <td>网页搜索模板</td>
                 <td><code>/web gh tauri</code> 会使用 <code>gh</code> 模板搜索 <code>tauri</code>。</td>
@@ -628,10 +638,21 @@
           <ol>
             <li>按 <code>Alt+3</code> 打开 AI 面板，进行普通对话。</li>
             <li>开启划词功能后，可在任意应用中按住 <code>Ctrl</code> 并用鼠标拖选文本。</li>
-            <li>松开鼠标后会自动呼出划词 AI 小对话框，对选中的内容执行快捷处理。</li>
+            <li>松开鼠标后会自动呼出划词浮条，浮条最多展示 6 个可见入口，多余 AI 动作收进下拉菜单。</li>
+            <li>记录图标会保存当前划词原文，保存后短暂显示“已记录”再关闭浮条；记录可通过 <code>/mark</code> 找回。</li>
+            <li>待办入口会先选择提醒时间，支持 10 分钟后、30 分钟后、1 小时后、今晚/明晚 20:00、明早 09:00 和自定义日期时间；待办可通过 <code>/todo</code> 管理。</li>
             <li>划词动作包括翻译、总结、专业解释、润色和提取要点；可在设置中控制每个动作是否显示。</li>
             <li>取词会临时模拟 <code>Ctrl+C</code>，等待系统剪贴板内容变化后恢复原文本剪贴板。</li>
           </ol>
+
+          <div class="doc-block">
+            <h3>待办提醒</h3>
+            <ul>
+              <li>到提醒时间后会弹出独立提醒窗口，可直接完成或稍后提醒。</li>
+              <li>稍后提醒默认延迟 10 分钟。</li>
+              <li>已完成待办可在设置中批量清理。</li>
+            </ul>
+          </div>
 
           <div class="doc-block">
             <h3>AI 配置</h3>
@@ -656,6 +677,7 @@
             <li>搜索权重、网页搜索模板、自定义命令、快捷短语、排除规则。</li>
             <li>Everything 全路径搜索和内容搜索选项。</li>
             <li>AI Provider、Model Profile、Assistant 和划词动作入口。</li>
+            <li>划词记录和待办提醒清理操作。</li>
             <li>开机自启动和划词触发模式开关。</li>
             <li>更新检查开关、检查间隔、预发布版本开关和手动检查。</li>
           </ul>
@@ -784,6 +806,8 @@ cargo test --manifest-path src-tauri\Cargo.toml</code></pre>
             <li><code>Alt+1</code> 呼出和隐藏主窗口。</li>
             <li>修改主快捷键后无需重启即可生效。</li>
             <li>按住 <code>Ctrl</code> 并用鼠标划词，松开后应呼出划词 AI 小对话框。</li>
+            <li>划词浮条中点击记录图标，应短暂显示“已记录”并关闭；输入 <code>/mark</code> 应能看到刚保存的记录。</li>
+            <li>划词浮条中点击待办，选择提醒时间后加入；输入 <code>/todo</code> 应能看到待办并执行完成、稍后、修改和删除。</li>
             <li>输入 <code>/</code> 打开 Slash Board，验证范围切换、拖拽排序和隐藏范围。</li>
             <li>输入 <code>/tools</code> 选择 <code>enc</code> 后，输入框应进入 <code>/tools enc </code>。</li>
             <li>搜索并启动 3 个本机应用。</li>
@@ -816,7 +840,7 @@ cargo test --manifest-path src-tauri\Cargo.toml</code></pre>
 
         <footer class="footer">
           <p>文档位置：<code>product-html/index.html</code></p>
-          <p>当前版本：<code>v0.2.0</code>。最近整理：2026-06-08。</p>
+          <p>当前版本：<code>v0.2.0</code>。最近整理：2026-06-09。</p>
         </footer>
       </main>
     </div>
