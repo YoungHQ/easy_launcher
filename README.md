@@ -70,6 +70,12 @@ npm run tauri -- build
 
 如果 Rust 不在系统 `PATH` 中，可以使用 `npm run tauri -- ...`，它会通过 `scripts/tauri-with-rust-env.mjs` 读取当前 shell 或 `.env.local` 中的 `CARGO_HOME`、`RUSTUP_HOME`。
 
+## GitHub Actions 打包
+
+推送到 `main` 后，GitHub Actions 会自动运行 `Windows Build` workflow，在 Windows runner 上完成前端构建、Rust 测试和 Tauri 打包。构建完成后，可以在对应 workflow run 的 Artifacts 中下载 `easy-launcher-windows`，其中包含生成的 Windows 安装包。
+
+发布版本时，推送 `v*` 标签或发布 GitHub Release 后，同一个 workflow 会尝试把生成的安装包上传到该 Release。
+
 ## 本地数据和安全
 
 运行时数据目录：

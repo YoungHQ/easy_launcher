@@ -82,6 +82,10 @@ const TRAY_MENU_EVERYTHING: &str = "tray-check-everything";
 const TRAY_MENU_EXIT: &str = "tray-exit";
 const STARTUP_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_VALUE_NAME: &str = "EasyLauncher";
+// Persisted "x,y" of the launcher window so it reopens where the user last left
+// it across restarts. Machine-specific, so deliberately NOT in
+// EXPORTABLE_SETTING_KEYS.
+const LAUNCHER_POSITION_SETTING_KEY: &str = "launcher.window.position";
 const SEARCH_RESULT_LIMIT: usize = 20;
 const QUICK_ENTRY_RECENT_STORAGE_LIMIT: usize = 50;
 const SEARCH_CACHE_MAX_ENTRIES: usize = 64;
@@ -4427,6 +4431,14 @@ fn set_settings_panel_open(app: &AppHandle, open: bool) {
 }
 
 fn hide_window_to_tray(window: &tauri::WebviewWindow) {
+    // Remember where the launcher is before hiding (Esc, shortcut toggle, tray),
+    // so re-summoning it — including after a full restart — keeps the user's
+    // position instead of falling back to the default placement.
+    if let Some(launcher_position) =
+        window.app_handle().try_state::<LauncherWindowPositionStore>()
+    {
+        store_launcher_position(window, launcher_position.inner());
+    }
     let _ = window.eval(
         "if (document.activeElement instanceof HTMLElement) { document.activeElement.blur(); }",
     );
@@ -4456,7 +4468,41 @@ fn store_launcher_position(
         if let Ok(mut stored_position) = launcher_position.lock() {
             *stored_position = Some(position);
         }
+        // Also persist to SQLite so the position survives a restart, not just
+        // hide/show within one session.
+        if let Some(storage) = window.app_handle().try_state::<StorageState>() {
+            if let Ok(storage) = storage.lock() {
+                let _ = storage.set_setting(
+                    LAUNCHER_POSITION_SETTING_KEY,
+                    &format!("{},{}", position.x, position.y),
+                );
+            }
+        }
     }
+}
+
+// Parse a persisted "x,y" launcher position back into a point.
+fn parse_launcher_position(value: &str) -> Option<PhysicalPosition<i32>> {
+    let (x, y) = value.split_once(',')?;
+    Some(PhysicalPosition::new(
+        x.trim().parse().ok()?,
+        y.trim().parse().ok()?,
+    ))
+}
+
+// Default launcher placement when nothing has been stored yet: horizontally
+// centered, vertically a little below center (~58% of the work area height), so
+// it sits just under the middle rather than dead center or top-left.
+fn default_launcher_position(window: &tauri::WebviewWindow) -> Option<PhysicalPosition<i32>> {
+    let monitor = window.current_monitor().ok().flatten()?;
+    let monitor_pos = monitor.position();
+    let monitor_size = monitor.size();
+    let window_size = window
+        .outer_size()
+        .unwrap_or(PhysicalSize::new(SEARCH_WINDOW_WIDTH, SEARCH_WINDOW_HEIGHT));
+    let x = monitor_pos.x + (monitor_size.width as i32 - window_size.width as i32) / 2;
+    let y = monitor_pos.y + (monitor_size.height as i32 * 58 / 100 - window_size.height as i32 / 2);
+    Some(PhysicalPosition::new(x.max(monitor_pos.x), y.max(monitor_pos.y)))
 }
 
 fn restore_search_window(
@@ -4469,8 +4515,23 @@ fn restore_search_window(
         .and_then(|stored_position| *stored_position);
     disable_native_window_frame(window);
     let _ = window.set_size(PhysicalSize::new(SEARCH_WINDOW_WIDTH, SEARCH_WINDOW_HEIGHT));
-    if let Some(position) = position {
-        let _ = window.set_position(position);
+    match position {
+        // Restore the position the user last left the launcher at (recorded when
+        // they hide it or open settings, and persisted across restarts).
+        Some(position) => {
+            let _ = window.set_position(position);
+        }
+        // No stored position yet (first ever launch). Place it horizontally
+        // centered and a little below center, rather than dead-center or drifting
+        // to the top-left corner.
+        None => match default_launcher_position(window) {
+            Some(position) => {
+                let _ = window.set_position(position);
+            }
+            None => {
+                let _ = window.center();
+            }
+        },
     }
     disable_native_window_frame(window);
 }
@@ -4870,6 +4931,24 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
+            // Persist the launcher position whenever the window moves, so it
+            // survives every dismiss path (Esc, click-away/blur, or a system
+            // hide we never see) without having to hook each one. Skipped while
+            // the settings panel is open, since the window is then the centered
+            // settings view rather than the launcher.
+            if window.label() == "main" {
+                if let WindowEvent::Moved(_) = event {
+                    let app = window.app_handle();
+                    if !settings_panel_is_open(app) {
+                        if let (Some(webview), Some(launcher_position)) = (
+                            app.get_webview_window("main"),
+                            app.try_state::<LauncherWindowPositionStore>(),
+                        ) {
+                            store_launcher_position(&webview, launcher_position.inner());
+                        }
+                    }
+                }
+            }
             if window.label() == "reminder" {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
@@ -4890,6 +4969,14 @@ pub fn run() {
                 .get_setting("ai.shortcut")
                 .map_err(|error| error.to_string())?
                 .unwrap_or_else(|| AI_SHORTCUT_LABEL.into());
+            // Load the persisted launcher window position (if any) before the
+            // storage handle is moved into shared state, so the first summon can
+            // restore where the user last left the window across restarts.
+            let initial_launcher_position = storage
+                .get_setting(LAUNCHER_POSITION_SETTING_KEY)
+                .ok()
+                .flatten()
+                .and_then(|value| parse_launcher_position(&value));
             let storage = Arc::new(Mutex::new(storage));
             app.manage(storage);
             let todo_reminders = Arc::new(Mutex::new(TodoReminderRuntimeState::default()));
@@ -4949,7 +5036,7 @@ pub fn run() {
                 SEARCH_CACHE_MAX_ENTRIES,
                 SEARCH_CACHE_TTL,
             ))));
-            app.manage(Mutex::new(None::<PhysicalPosition<i32>>));
+            app.manage(Mutex::new(initial_launcher_position));
             app.manage(Arc::new(AtomicBool::new(false)));
             warm_app_scan_cache();
             create_tray(app)?;
@@ -5294,6 +5381,27 @@ mod tests {
         assert!(validate_import_setting("file.editor.path", "").is_ok());
         assert!(validate_import_setting("folder.editor.path", ".").is_ok());
         assert!(validate_import_setting("file.editor.path", "Z:\\missing\\editor.exe").is_err());
+    }
+
+    #[test]
+    fn launcher_position_round_trips_and_rejects_garbage() {
+        let parsed = parse_launcher_position("120,340").expect("parse valid position");
+        assert_eq!(parsed.x, 120);
+        assert_eq!(parsed.y, 340);
+
+        // Negative coordinates (multi-monitor setups extend left/up) parse fine.
+        let negative = parse_launcher_position("-1920,-50").expect("parse negative position");
+        assert_eq!(negative.x, -1920);
+        assert_eq!(negative.y, -50);
+
+        // Whitespace around the comma is tolerated.
+        assert!(parse_launcher_position(" 10 , 20 ").is_some());
+
+        // Malformed values fall back to None so the default placement kicks in.
+        assert!(parse_launcher_position("").is_none());
+        assert!(parse_launcher_position("120").is_none());
+        assert!(parse_launcher_position("a,b").is_none());
+        assert!(parse_launcher_position("1,2,3").is_none());
     }
 
     #[test]

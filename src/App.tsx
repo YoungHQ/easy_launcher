@@ -4,6 +4,7 @@ import type {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
   ReactNode,
+  UIEvent as ReactUIEvent,
 } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -15,6 +16,7 @@ import {
   useDisplayTranslations,
 } from "./i18n";
 import type { LanguagePreference } from "./i18n";
+import { Markdown } from "./markdown";
 
 type ResultKind =
   | "app"
@@ -531,6 +533,7 @@ const actionLabels: Record<ActionKind, string> = {
 };
 
 const SEARCH_DEBOUNCE_MS = 160;
+const RESULT_PAGE_STEP = 5;
 const LAUNCHER_WINDOW_WIDTH = 728;
 const SETTINGS_WINDOW_WIDTH = 960;
 const SETTINGS_WINDOW_HEIGHT = 700;
@@ -551,7 +554,7 @@ const SELECTION_RESULT_PRIMARY_ACTION_LIMIT = 6;
 const TODO_SNOOZE_MINUTES = 10;
 const MODEL_BINDING_SEPARATOR = "::";
 const SEARCH_WINDOW_MIN_HEIGHT = 64;
-const SEARCH_WINDOW_MAX_HEIGHT = 286;
+const SEARCH_WINDOW_MAX_HEIGHT = 420;
 const SEARCH_WINDOW_BOTTOM_GUTTER = 10;
 const BUILTIN_SELECTION_ASSISTANT_IDS = new Set([
   "translation-assistant",
@@ -561,18 +564,27 @@ const BUILTIN_SELECTION_ASSISTANT_IDS = new Set([
   "key-points-assistant",
 ]);
 
-const settingsSections: { id: SettingsSection; label: string; meta: string }[] = [
-  { id: "general", label: "通用", meta: "快捷键、系统" },
-  { id: "search", label: "搜索", meta: "来源、权重" },
-  { id: "tools", label: "工具", meta: "密码、转换" },
-  { id: "ai", label: "AI", meta: "模型、助手" },
-  { id: "selection", label: "划词", meta: "触发、浮窗" },
-  { id: "commands", label: "命令", meta: "固定入口" },
-  { id: "phrases", label: "短语", meta: "常用文本" },
-  { id: "webSearch", label: "网页", meta: "搜索模板" },
-  { id: "exclusions", label: "隐藏", meta: "排除规则" },
-  { id: "updates", label: "更新", meta: "版本、Release" },
-  { id: "backup", label: "配置", meta: "导入导出" },
+type SettingsGroup = "core" | "ai" | "entries" | "system";
+
+const settingsSections: { id: SettingsSection; label: string; meta: string; group: SettingsGroup }[] = [
+  { id: "general", label: "通用", meta: "快捷键、系统", group: "core" },
+  { id: "search", label: "搜索", meta: "来源、权重", group: "core" },
+  { id: "tools", label: "工具", meta: "密码、转换", group: "core" },
+  { id: "ai", label: "AI", meta: "模型、助手", group: "ai" },
+  { id: "selection", label: "划词", meta: "触发、浮窗", group: "ai" },
+  { id: "commands", label: "命令", meta: "固定入口", group: "entries" },
+  { id: "phrases", label: "短语", meta: "常用文本", group: "entries" },
+  { id: "webSearch", label: "网页", meta: "搜索模板", group: "entries" },
+  { id: "exclusions", label: "隐藏", meta: "排除规则", group: "entries" },
+  { id: "updates", label: "更新", meta: "版本、Release", group: "system" },
+  { id: "backup", label: "配置", meta: "导入导出", group: "system" },
+];
+
+const settingsGroupLabels: { id: SettingsGroup; label: string }[] = [
+  { id: "core", label: "基础" },
+  { id: "ai", label: "AI 与划词" },
+  { id: "entries", label: "入口与文本" },
+  { id: "system", label: "系统与维护" },
 ];
 
 const slashBoardScopes: { id: SlashBoardScope; label: string; title: string; subtitle: string }[] = [
@@ -750,14 +762,24 @@ function MainApp() {
   const [resultAliases, setResultAliases] = useState<ResultAlias[]>([]);
   const [smartRankingEnabled, setSmartRankingEnabled] = useState(true);
   const [actionMessage, setActionMessage] = useState("输入关键词搜索");
+  // True while a debounced query is in flight, so the search line can show a
+  // thin progress bar instead of silently changing height as results stream in.
+  const [isSearching, setIsSearching] = useState(false);
   const [appError, setAppError] = useState<AppError | null>(null);
   const [contextSession, setContextSession] = useState<ResultContextSession | null>(null);
   const launcherRef = useRef<HTMLElement | null>(null);
+  const windowSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const heightTweenRef = useRef<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const resultItemRefs = useRef<Array<HTMLDivElement | null>>([]);
   const aiInputRef = useRef<HTMLTextAreaElement | null>(null);
   const latestSearchRequestId = useRef(0);
   const aiMessagesRef = useRef<AiMessage[]>([]);
+  const aiMessageListRef = useRef<HTMLDivElement | null>(null);
+  // Whether the message list should stick to the bottom as new content streams
+  // in. Flipped off when the user scrolls up, back on when they return to the
+  // bottom, so auto-scroll never fights a user who is reading earlier messages.
+  const aiStickToBottomRef = useRef(true);
   const displayLanguage = resolveDisplayLanguage(languageOption);
   useDisplayTranslations(displayLanguage);
   const searchSourceLabels = {
@@ -924,6 +946,33 @@ function MainApp() {
     aiMessagesRef.current = aiMessages;
   }, [aiMessages]);
 
+  // Switching into a different conversation should always land at the bottom
+  // (the latest messages), regardless of where the previous one was scrolled.
+  useEffect(() => {
+    aiStickToBottomRef.current = true;
+  }, [selectedAiConversationId]);
+
+  // Follow the bottom of the AI conversation as messages and streaming deltas
+  // arrive, but only while the user hasn't scrolled up to read earlier replies.
+  useEffect(() => {
+    if (viewMode !== "ai") {
+      return;
+    }
+    const list = aiMessageListRef.current;
+    if (!list || !aiStickToBottomRef.current) {
+      return;
+    }
+    list.scrollTop = list.scrollHeight;
+  }, [aiMessages, viewMode]);
+
+  function handleAiMessageListScroll(event: ReactUIEvent<HTMLDivElement>) {
+    const list = event.currentTarget;
+    // Treat "within 24px of the bottom" as still at the bottom, so a tiny
+    // rounding gap or the last streamed line doesn't drop out of follow mode.
+    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 24;
+    aiStickToBottomRef.current = atBottom;
+  }
+
   useEffect(() => {
     if (!launcherRef.current) {
       return;
@@ -950,16 +999,66 @@ function MainApp() {
             ),
           );
 
-    getCurrentWindow()
-      .setSize(new LogicalSize(width, height))
-      .catch(() => {
+    const appWindow = getCurrentWindow();
+    // Settings / AI pages have a fixed size and are entered by an explicit
+    // action, so snap to the target. The launcher height changes repeatedly
+    // while results and icons stream in, so tween it to avoid the window
+    // "jumping" mid-type.
+    const shouldTween = !showSettings && viewMode !== "ai";
+
+    const applySize = (nextWidth: number, nextHeight: number) => {
+      windowSizeRef.current = { width: nextWidth, height: nextHeight };
+      appWindow.setSize(new LogicalSize(nextWidth, nextHeight)).catch(() => {
         // Browser preview has no desktop window to resize.
       });
+    };
+
+    if (heightTweenRef.current !== null) {
+      cancelAnimationFrame(heightTweenRef.current);
+      heightTweenRef.current = null;
+    }
+
+    const previous = windowSizeRef.current;
+    if (!shouldTween || !previous || previous.width !== width) {
+      // First paint, mode switch, or width change: snap without animation.
+      applySize(width, height);
+      return;
+    }
+
+    const startHeight = previous.height;
+    if (startHeight === height) {
+      return;
+    }
+
+    const distance = height - startHeight;
+    const duration = Math.min(180, 80 + Math.abs(distance) * 0.6);
+    const startTime = performance.now();
+
+    const step = (now: number) => {
+      const t = Math.min(1, (now - startTime) / duration);
+      // ease-out cubic
+      const eased = 1 - Math.pow(1 - t, 3);
+      const current = Math.round(startHeight + distance * eased);
+      applySize(width, current);
+      if (t < 1) {
+        heightTweenRef.current = requestAnimationFrame(step);
+      } else {
+        heightTweenRef.current = null;
+      }
+    };
+
+    heightTweenRef.current = requestAnimationFrame(step);
+
+    return () => {
+      if (heightTweenRef.current !== null) {
+        cancelAnimationFrame(heightTweenRef.current);
+        heightTweenRef.current = null;
+      }
+    };
   }, [
     appError,
     displayResults.length,
     query,
-    selectedIndex,
     showSettings,
     slashBoardActive,
     slashBoardResults.length,
@@ -1490,6 +1589,7 @@ function MainApp() {
         Math.min(current, Math.max(event.payload.results.length - 1, 0)),
       );
       setActionMessage(event.payload.results.length > 0 ? "已补充文件结果" : "没有匹配结果");
+      setIsSearching(false);
       clearError();
     }).then((handler) => {
       unlisten = handler;
@@ -1531,7 +1631,16 @@ function MainApp() {
     const requestId = reserveSearchRequestId();
     const searchQuery = query;
 
+    if (searchQuery.trim().length === 0) {
+      setIsSearching(false);
+    }
+
     async function runSearch() {
+      // Only show the progress bar for non-empty queries, so clearing the box
+      // doesn't flash a loading state.
+      if (searchQuery.trim().length > 0) {
+        setIsSearching(true);
+      }
       try {
         const response = await invokeSearchWithRecents(searchQuery, requestId);
         if (response !== null) {
@@ -1546,6 +1655,12 @@ function MainApp() {
           setSelectedIndex(0);
           setActionMessage("浏览器预览模式，使用 mock 结果");
           showError("搜索", "搜索失败", error);
+        }
+      } finally {
+        // The streamed file-results event (search-progress) may still arrive
+        // after this resolves, but the first batch is enough to drop the bar.
+        if (isLatestSearchRequest(requestId)) {
+          setIsSearching(false);
         }
       }
     }
@@ -2008,6 +2123,10 @@ function MainApp() {
       selectedAiConversation?.assistantId === selectedAiAssistant.id ? selectedAiConversation.id : null;
     const isNewConversation = conversationId === null;
     setAiInput("");
+    if (aiInputRef.current) {
+      // Collapse the auto-grown composer back to a single row after sending.
+      aiInputRef.current.style.height = "auto";
+    }
     setActiveAiRequestId(requestId);
     try {
       const started = await invoke<AiChatStarted>("send_ai_chat_message", {
@@ -3650,17 +3769,12 @@ function MainApp() {
         return;
       }
 
-      if (event.key === "ArrowDown") {
+      const slashMove = navMoveFromKey(event.key);
+      if (slashMove) {
         event.preventDefault();
         setSelectedIndex((current) =>
-          Math.min(current + 1, Math.max(slashBoardResults.length - 1, 0)),
+          stepSelectionIndex(current, slashBoardResults.length, slashMove),
         );
-        return;
-      }
-
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        setSelectedIndex((current) => Math.max(current - 1, 0));
         return;
       }
 
@@ -3683,17 +3797,12 @@ function MainApp() {
     }
 
     if (contextSession) {
-      if (event.key === "ArrowDown") {
+      const contextMove = navMoveFromKey(event.key);
+      if (contextMove) {
         event.preventDefault();
         setSelectedIndex((current) =>
-          Math.min(current + 1, Math.max(displayResults.length - 1, 0)),
+          stepSelectionIndex(current, visibleContextActions.length, contextMove),
         );
-        return;
-      }
-
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        setSelectedIndex((current) => Math.max(current - 1, 0));
         return;
       }
 
@@ -3715,17 +3824,12 @@ function MainApp() {
       }
     }
 
-    if (event.key === "ArrowDown") {
+    const move = navMoveFromKey(event.key);
+    if (move) {
       event.preventDefault();
       setSelectedIndex((current) =>
-        Math.min(current + 1, Math.max(displayResults.length - 1, 0)),
+        stepSelectionIndex(current, displayResults.length, move),
       );
-      return;
-    }
-
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      setSelectedIndex((current) => Math.max(current - 1, 0));
       return;
     }
 
@@ -3806,9 +3910,12 @@ function MainApp() {
               placeholder={
                 contextSession
                   ? `筛选操作：${contextSession.result.title}`
-                  : "搜索，输入 option 打开设置"
+                  : `搜索，${toolMenuAlias || "/"} 打开快捷面板，option 进入设置`
               }
             />
+            {isSearching && !contextSession ? (
+              <span className="searchProgress" aria-hidden="true" />
+            ) : null}
           </div>
         ) : null}
 
@@ -3832,30 +3939,37 @@ function MainApp() {
           <>
             {appError ? <ErrorNotice error={appError} onDismiss={clearError} /> : null}
             <div className="settingsPane">
+              <nav className="settingsNav" aria-label="设置分组">
               <button
                 className="settingsCloseButton"
                 type="button"
                 aria-label="关闭设置"
                 onClick={closeSettingsPanel}
               >
-                关闭
+                返回
               </button>
-              <nav className="settingsNav" aria-label="设置分组">
-              {settingsSections.map((section) => (
-                <button
-                  className={
-                    activeSettingsSection === section.id
-                      ? "settingsNavItem active"
-                      : "settingsNavItem"
-                  }
-                  type="button"
-                  aria-current={activeSettingsSection === section.id ? "page" : undefined}
-                  key={section.id}
-                  onClick={() => setActiveSettingsSection(section.id)}
-                >
-                  <span>{section.label}</span>
-                  <small>{section.meta}</small>
-                </button>
+              {settingsGroupLabels.map((group) => (
+                <div className="settingsNavGroup" key={group.id}>
+                  <span className="settingsNavGroupLabel">{group.label}</span>
+                  {settingsSections
+                    .filter((section) => section.group === group.id)
+                    .map((section) => (
+                      <button
+                        className={
+                          activeSettingsSection === section.id
+                            ? "settingsNavItem active"
+                            : "settingsNavItem"
+                        }
+                        type="button"
+                        aria-current={activeSettingsSection === section.id ? "page" : undefined}
+                        key={section.id}
+                        onClick={() => setActiveSettingsSection(section.id)}
+                      >
+                        <span>{section.label}</span>
+                        <small>{section.meta}</small>
+                      </button>
+                    ))}
+                </div>
               ))}
             </nav>
 
@@ -4991,15 +5105,35 @@ function MainApp() {
                         }
                         placeholder="固定 URL、文件路径或程序路径"
                       />
-                      <button type="button" onClick={saveCustomCommand}>
-                        {customCommandDraft.id ? "更新" : "新增"}
-                      </button>
+                      <div className="editorActions">
+                        <button type="button" onClick={saveCustomCommand}>
+                          {customCommandDraft.id ? "更新" : "新增"}
+                        </button>
+                        {customCommandDraft.id ? (
+                          <button
+                            type="button"
+                            className="secondaryButton"
+                            onClick={() =>
+                              setCustomCommandDraft({ name: "", commandType: "url", target: "" })
+                            }
+                          >
+                            取消
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
 
                     {customCommands.length > 0 ? (
                       <div className="customCommandList">
                         {customCommands.map((command) => (
-                          <div className="customCommandItem" key={command.id}>
+                          <div
+                            className={
+                              customCommandDraft.id === command.id
+                                ? "customCommandItem editing"
+                                : "customCommandItem"
+                            }
+                            key={command.id}
+                          >
                             <span>
                               <strong>{command.name}</strong>
                               <small>
@@ -5009,7 +5143,11 @@ function MainApp() {
                             <button type="button" onClick={() => editCustomCommand(command)}>
                               编辑
                             </button>
-                            <button type="button" onClick={() => deleteCustomCommand(command)}>
+                            <button
+                              type="button"
+                              className="dangerButton"
+                              onClick={() => deleteCustomCommand(command)}
+                            >
                               删除
                             </button>
                           </div>
@@ -5060,15 +5198,34 @@ function MainApp() {
                         }
                         placeholder="常用文本内容"
                       />
-                      <button type="button" onClick={savePhrase}>
-                        {phraseDraft.id ? "更新" : "新增"}
-                      </button>
+                      <div className="editorActions">
+                        <button type="button" onClick={savePhrase}>
+                          {phraseDraft.id ? "更新" : "新增"}
+                        </button>
+                        {phraseDraft.id ? (
+                          <button
+                            type="button"
+                            className="secondaryButton"
+                            onClick={() => {
+                              setPhraseDraft({ title: "", text: "" });
+                              setActionMessage("已取消编辑");
+                            }}
+                          >
+                            取消
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
 
                     {phrases.length > 0 ? (
                       <div className="phraseList">
                         {phrases.map((phrase) => (
-                          <div className="phraseItem" key={phrase.id}>
+                          <div
+                            className={
+                              phraseDraft.id === phrase.id ? "phraseItem editing" : "phraseItem"
+                            }
+                            key={phrase.id}
+                          >
                             <span>
                               <strong>{phrase.title}</strong>
                               <small>{phrase.text}</small>
@@ -5076,7 +5233,11 @@ function MainApp() {
                             <button type="button" onClick={() => editPhrase(phrase)}>
                               编辑
                             </button>
-                            <button type="button" onClick={() => deletePhrase(phrase)}>
+                            <button
+                              type="button"
+                              className="dangerButton"
+                              onClick={() => deletePhrase(phrase)}
+                            >
                               删除
                             </button>
                           </div>
@@ -5156,15 +5317,39 @@ function MainApp() {
                         }
                         placeholder="URL 模板，必须包含 {query}"
                       />
-                      <button type="button" onClick={saveWebSearchTemplate}>
-                        {webSearchTemplateDraft.id ? "更新" : "新增"}
-                      </button>
+                      <div className="editorActions">
+                        <button type="button" onClick={saveWebSearchTemplate}>
+                          {webSearchTemplateDraft.id ? "更新" : "新增"}
+                        </button>
+                        {webSearchTemplateDraft.id ? (
+                          <button
+                            type="button"
+                            className="secondaryButton"
+                            onClick={() =>
+                              setWebSearchTemplateDraft({
+                                keyword: "",
+                                name: "",
+                                urlTemplate: "https://www.bing.com/search?q={query}",
+                              })
+                            }
+                          >
+                            取消
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
 
                     {webSearchTemplates.length > 0 ? (
                       <div className="phraseList">
                         {webSearchTemplates.map((template) => (
-                          <div className="phraseItem" key={template.id}>
+                          <div
+                            className={
+                              webSearchTemplateDraft.id === template.id
+                                ? "phraseItem editing"
+                                : "phraseItem"
+                            }
+                            key={template.id}
+                          >
                             <span>
                               <strong>{template.name}</strong>
                               <small>
@@ -5174,7 +5359,11 @@ function MainApp() {
                             <button type="button" onClick={() => editWebSearchTemplate(template)}>
                               编辑
                             </button>
-                            <button type="button" onClick={() => deleteWebSearchTemplate(template)}>
+                            <button
+                              type="button"
+                              className="dangerButton"
+                              onClick={() => deleteWebSearchTemplate(template)}
+                            >
                               删除
                             </button>
                           </div>
@@ -5238,15 +5427,35 @@ function MainApp() {
                             : "例如 C:\\Temp\\*"
                         }
                       />
-                      <button type="button" onClick={saveExclusionRule}>
-                        {exclusionRuleDraft.id ? "更新" : "新增"}
-                      </button>
+                      <div className="editorActions">
+                        <button type="button" onClick={saveExclusionRule}>
+                          {exclusionRuleDraft.id ? "更新" : "新增"}
+                        </button>
+                        {exclusionRuleDraft.id ? (
+                          <button
+                            type="button"
+                            className="secondaryButton"
+                            onClick={() =>
+                              setExclusionRuleDraft({ matchType: "result_id", pattern: "" })
+                            }
+                          >
+                            取消
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
 
                     {exclusionRules.length > 0 ? (
                       <div className="exclusionList">
                         {exclusionRules.map((rule) => (
-                          <div className="exclusionItem" key={rule.id}>
+                          <div
+                            className={
+                              exclusionRuleDraft.id === rule.id
+                                ? "exclusionItem editing"
+                                : "exclusionItem"
+                            }
+                            key={rule.id}
+                          >
                             <span>
                               <strong>
                                 {rule.matchType === "result_id" ? "结果 ID" : "路径规则"}
@@ -5256,7 +5465,11 @@ function MainApp() {
                             <button type="button" onClick={() => editExclusionRule(rule)}>
                               编辑
                             </button>
-                            <button type="button" onClick={() => deleteExclusionRule(rule)}>
+                            <button
+                              type="button"
+                              className="dangerButton"
+                              onClick={() => deleteExclusionRule(rule)}
+                            >
                               删除
                             </button>
                           </div>
@@ -5401,9 +5614,22 @@ function MainApp() {
             <aside className="aiAssistantColumn">
               <div className="aiSidebarHeader">
                 <strong>AI</strong>
-                <button type="button" onClick={() => openSettingsPanel("ai")}>
-                  设置
-                </button>
+                <span className="aiSidebarHeaderActions">
+                  <button type="button" onClick={() => openSettingsPanel("ai")}>
+                    设置
+                  </button>
+                  <button
+                    type="button"
+                    className="aiSidebarClose"
+                    aria-label="关闭 AI 对话，返回搜索"
+                    title="返回搜索"
+                    onClick={() => {
+                      void openSearchPanel();
+                    }}
+                  >
+                    关闭
+                  </button>
+                </span>
               </div>
               {aiProfileMissing ? (
                 <div className="aiEmptyState">
@@ -5569,17 +5795,44 @@ function MainApp() {
                   <small>新会话</small>
                 )}
               </div>
-              <div className="aiMessageList">
+              <div
+                className="aiMessageList"
+                ref={aiMessageListRef}
+                onScroll={handleAiMessageListScroll}
+              >
                 {aiMessages.map((message) => (
                   <article className={`aiMessage ${message.role}`} key={message.id}>
-                    <div>
+                    <div className="aiMessageHeader">
                       <strong>{message.role === "user" ? "你" : "AI"}</strong>
-                      <button type="button" onClick={() => deleteAiMessage(message.id)}>
+                      <button
+                        className="aiMessageDelete"
+                        type="button"
+                        aria-label="删除这条消息"
+                        onClick={() => {
+                          if (window.confirm("删除这条消息？")) {
+                            deleteAiMessage(message.id);
+                          }
+                        }}
+                      >
                         删除
                       </button>
                     </div>
-                    <p>{message.content || (message.status === "streaming" ? "..." : "")}</p>
-                    {message.error ? <small>{message.error}</small> : null}
+                    <div className="aiMessageBubble">
+                      {message.content ? (
+                        message.role === "user" ? (
+                          <p>{message.content}</p>
+                        ) : (
+                          <Markdown content={message.content} />
+                        )
+                      ) : message.status === "streaming" ? (
+                        <p className="aiTypingIndicator" aria-label="正在生成">
+                          <span />
+                          <span />
+                          <span />
+                        </p>
+                      ) : null}
+                      {message.error ? <small>{message.error}</small> : null}
+                    </div>
                   </article>
                 ))}
                 {aiMessages.length === 0 ? (
@@ -5598,21 +5851,29 @@ function MainApp() {
                   autoFocus
                   ref={aiInputRef}
                   value={aiInput}
-                  onChange={(event) => setAiInput(event.target.value)}
+                  rows={1}
+                  onChange={(event) => {
+                    setAiInput(event.target.value);
+                    autoGrowTextarea(event.target);
+                  }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
                       sendAiMessage();
                     }
                   }}
-                  placeholder="输入消息"
+                  placeholder="输入消息，Enter 发送，Shift+Enter 换行"
                 />
                 {activeAiRequestId ? (
                   <button type="button" onClick={cancelAiMessage}>
                     取消
                   </button>
                 ) : (
-                  <button type="button" onClick={sendAiMessage} disabled={!selectedAiAssistant || aiProfileMissing}>
+                  <button
+                    type="button"
+                    onClick={sendAiMessage}
+                    disabled={!selectedAiAssistant || aiProfileMissing || aiInput.trim().length === 0}
+                  >
                     发送
                   </button>
                 )}
@@ -5737,7 +5998,22 @@ function MainApp() {
                   contextSession ? (
                     <span className="resultAction">执行</span>
                   ) : (
-                    <span className="resultAction">{resultActionLabel(result)}</span>
+                    <>
+                      <span className="resultAction">{resultActionLabel(result)}</span>
+                      <button
+                        type="button"
+                        className="resultMoreButton"
+                        aria-label="更多操作"
+                        title="更多操作（Shift+Enter 或右键）"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setSelectedIndex(index);
+                          openResultContextMenu(result);
+                        }}
+                      >
+                        ⋯
+                      </button>
+                    </>
                   )
                 }
                 className={[
@@ -6982,7 +7258,7 @@ function ResultRow({
           <img
             alt=""
             aria-hidden="true"
-            className={showImageIcon ? "resultIconImage" : "resultIconImage loadingResultIconImage"}
+            className={showImageIcon ? "resultIconImage visible" : "resultIconImage"}
             draggable={false}
             onLoad={() => {
               imageFailedRef.current = false;
@@ -7004,9 +7280,7 @@ function ResultRow({
             src={attemptedIconSrc}
           />
         ) : null}
-        {showImageIcon ? null : (
-          icon
-        )}
+        <span className={showImageIcon ? "resultIconBadge hidden" : "resultIconBadge"}>{icon}</span>
       </span>
       <span className="resultText">{children}</span>
       <span className="resultActions">{actions}</span>
@@ -7747,6 +8021,65 @@ function nextSlashBoardScope(
   const safeIndex = currentIndex >= 0 ? currentIndex : 0;
   const nextIndex = (safeIndex + direction + scopes.length) % scopes.length;
   return scopes[nextIndex].id;
+}
+
+// Compute the next selected row index for keyboard navigation. Handles the
+// "move" verbs uniformly across the launcher's result surfaces:
+//   "up"/"down" wrap around (down from the last row goes to the first),
+//   "pageUp"/"pageDown" jump a fixed page, "home"/"end" snap to the edges.
+type NavMove = "up" | "down" | "pageUp" | "pageDown" | "home" | "end";
+const NAV_PAGE_STEP = 4;
+
+function stepSelectionIndex(current: number, count: number, move: NavMove): number {
+  if (count <= 0) {
+    return 0;
+  }
+  const last = count - 1;
+  const clamped = Math.min(Math.max(current, 0), last);
+  switch (move) {
+    case "up":
+      return clamped <= 0 ? last : clamped - 1;
+    case "down":
+      return clamped >= last ? 0 : clamped + 1;
+    case "pageUp":
+      return Math.max(0, clamped - NAV_PAGE_STEP);
+    case "pageDown":
+      return Math.min(last, clamped + NAV_PAGE_STEP);
+    case "home":
+      return 0;
+    case "end":
+      return last;
+    default:
+      return clamped;
+  }
+}
+
+// Grow a chat composer textarea to fit its content, up to a cap (after which it
+// scrolls). Keeps short drafts compact and long ones readable without a fixed,
+// cramped height.
+const AI_COMPOSER_MAX_HEIGHT = 168;
+function autoGrowTextarea(element: HTMLTextAreaElement) {
+  element.style.height = "auto";
+  element.style.height = `${Math.min(element.scrollHeight, AI_COMPOSER_MAX_HEIGHT)}px`;
+}
+
+function navMoveFromKey(key: string): NavMove | null {
+  switch (key) {
+    case "ArrowDown":
+      return "down";
+    case "ArrowUp":
+      return "up";
+    case "PageDown":
+      return "pageDown";
+    case "PageUp":
+      return "pageUp";
+    case "Home":
+      return "home";
+    case "End":
+      return "end";
+    default:
+      return null;
+  }
 }
 
 function slashBoardPreviewQueries(scope: SlashBoardScope, alias: string): string[] {

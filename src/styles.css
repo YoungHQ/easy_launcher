@@ -11,8 +11,24 @@
   --color-panel: #ffffff;
   --color-surface-subtle: #f6f8fb;
   --color-accent-hover: #d7e3f2;
+  /* Darker accent for primary-button hover, so the button deepens (reads as
+     "more active") on hover instead of lightening toward the disabled look. */
+  --color-accent-strong: #527ab0;
   --color-danger-hover: #e8d4ce;
-  --shadow-floating: 0 16px 38px rgba(41, 57, 74, 0.16), 0 2px 8px rgba(41, 57, 74, 0.08);
+  --shadow-floating: 0 16px 38px rgba(41, 57, 74, 0.16), 0 2px 8px var(--border-ink-soft);
+  /* Ink-tinted borders/dividers and accent-tinted focus rings, expressed as
+     opacity steps of the text and accent colors. Named here so the dozens of
+     previously-hardcoded rgba() literals route through tokens and a future
+     palette change propagates instead of leaving stale values behind. */
+  --border-ink-soft: rgba(41, 57, 74, 0.08);
+  --border-ink: rgba(41, 57, 74, 0.10);
+  --ring-accent: rgba(99, 139, 195, 0.56);
+  /* Shared transition timing so hover/selection/expand animations stay in sync
+     across surfaces instead of each rule inventing its own duration. */
+  --transition-fast: 120ms ease-out;
+  /* Shared label-column width so every settings row's control starts at the
+     same left edge, instead of each row sizing its label column to its text. */
+  --settings-label-width: 80px;
 
   color: var(--color-text);
   background: transparent;
@@ -68,16 +84,18 @@ button {
   grid-template-rows: auto auto auto;
   gap: 0;
   overflow: hidden;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 9px;
   clip-path: inset(0 round 9px);
   background: var(--color-background);
   box-shadow: none;
 }
 
+/* Context-menu mode is a small "filter the actions of one result" surface, so
+   it gets a restrained accent border instead of flooding the whole frame with
+   accent-soft. The tinted search line below carries the mode cue. */
 .launcherPage.contextMode {
-  border-color: rgba(99, 139, 195, 0.34);
-  background: var(--color-accent-soft);
+  border-color: rgba(99, 139, 195, 0.42);
 }
 
 .settingsPage {
@@ -108,6 +126,7 @@ button {
 }
 
 .searchLine {
+  position: relative;
   min-height: 54px;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -115,10 +134,44 @@ button {
   overflow: hidden;
   padding: 10px 14px;
   border: 0;
-  border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+  border-bottom: 1px solid var(--border-ink-soft);
   border-radius: 0;
   background: var(--color-panel);
   box-shadow: none;
+}
+
+/* Thin indeterminate progress bar pinned to the bottom of the search line
+   while a query is in flight. A sliding sliver, not a full sweep, so it reads
+   as "working" without flashing the whole frame. */
+.searchProgress {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  height: 2px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.searchProgress::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: 40%;
+  border-radius: 2px;
+  background: var(--color-accent);
+  animation: searchProgressSlide 0.9s ease-in-out infinite;
+}
+
+@keyframes searchProgressSlide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
 }
 
 .searchLine input {
@@ -152,7 +205,7 @@ button {
 .actionStatus {
   min-height: 24px;
   padding: 5px 14px 6px;
-  border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+  border-bottom: 1px solid var(--border-ink-soft);
   background: var(--color-surface-subtle);
   color: var(--color-muted-text);
   font-size: 11px;
@@ -235,22 +288,38 @@ button {
   background: var(--color-background);
 }
 
+/* "Back" entry pinned to the top of the settings nav. Going back is benign, so
+   it uses neutral surface colors, not the danger palette. Living inside the nav
+   (not floating over the scrolling content) lets the content pane use a
+   symmetric padding instead of reserving a right gutter to clear it. */
 .settingsCloseButton {
-  position: absolute;
-  top: 10px;
-  right: 12px;
-  z-index: 2;
-  min-height: 28px;
-  padding: 0 10px;
-  border-radius: 5px;
-  background: var(--color-danger-soft);
-  color: var(--color-danger);
+  width: 100%;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  padding: 0 9px;
+  border-radius: 6px;
+  background: var(--color-panel);
+  color: var(--color-muted-text);
   cursor: pointer;
   font-size: 12px;
+  font-weight: 700;
+  transition:
+    background 120ms ease-out,
+    color 120ms ease-out;
 }
 
 .settingsCloseButton:hover {
-  background: var(--color-danger-hover);
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
+.settingsCloseButton::before {
+  content: "‹";
+  font-size: 16px;
+  line-height: 1;
 }
 
 .settingsNav {
@@ -258,8 +327,32 @@ button {
   align-content: start;
   gap: 4px;
   padding: 10px;
-  border-right: 1px solid rgba(41, 57, 74, 0.08);
+  /* Scroll within the nav when the grouped list is taller than the window, so
+     the bottom groups stay reachable instead of being clipped off-screen. */
+  min-height: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border-ink-soft);
   background: var(--color-surface);
+}
+
+/* Sections are clustered into labelled groups so related pages sit together
+   instead of reading as one flat eleven-item list. */
+.settingsNavGroup {
+  display: grid;
+  gap: 2px;
+}
+
+.settingsNavGroup + .settingsNavGroup {
+  margin-top: 10px;
+}
+
+.settingsNavGroupLabel {
+  padding: 2px 9px;
+  color: var(--color-muted-text);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .settingsNavItem {
@@ -310,14 +403,14 @@ button {
   align-content: start;
   gap: 12px;
   overflow: auto;
-  padding: 14px 70px 14px 14px;
+  padding: 14px 16px;
 }
 
 .settingsHeader {
   display: grid;
   gap: 3px;
   padding-bottom: 8px;
-  border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+  border-bottom: 1px solid var(--border-ink-soft);
 }
 
 .settingsHeader strong {
@@ -343,17 +436,17 @@ button {
 }
 
 .shortcutRow {
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: var(--settings-label-width) minmax(0, 1fr) auto;
 }
 
 
 .configIoRow {
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: var(--settings-label-width) minmax(0, 1fr) auto auto;
 }
 
 .everythingPathRow,
 .iconCacheRow {
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: var(--settings-label-width) minmax(0, 1fr) auto auto;
 }
 
 .pathPreview {
@@ -363,7 +456,7 @@ button {
   align-items: center;
   overflow: hidden;
   padding: 0 8px;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 5px;
   background: var(--color-panel);
   color: var(--color-muted-text);
@@ -377,15 +470,15 @@ button {
 }
 
 .startupRow {
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: var(--settings-label-width) minmax(0, 1fr);
 }
 
 .settingButtonRow {
-  grid-template-columns: auto minmax(0, 160px) minmax(0, 160px);
+  grid-template-columns: var(--settings-label-width) minmax(0, 160px) minmax(0, 160px);
 }
 
 .systemButtonRow {
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: var(--settings-label-width) minmax(0, 1fr);
   align-items: start;
 }
 
@@ -443,7 +536,7 @@ button {
   width: 100%;
   min-width: 0;
   height: 28px;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 5px;
   background: var(--color-panel);
   color: var(--color-text);
@@ -458,16 +551,20 @@ button {
 .customCommandEditor input:focus,
 .phraseEditor input:focus,
 .exclusionEditor input:focus {
-  border-color: rgba(99, 139, 195, 0.56);
+  border-color: var(--ring-accent);
 }
 
-.settingRow button,
+/* Primary (accent) action buttons in settings rows and list editors. The
+   :not() guards keep this from clobbering toggle/segmented controls that share
+   these containers — those carry their own .sourceToggle / .segmentButton
+   styling and must look identical to the same controls on other pages. */
+.settingRow button:not(.sourceToggle):not(.segmentButton),
 .aiConfigLine button,
-.customCommandEditor button,
+.customCommandEditor button:not(.segmentButton),
 .customCommandItem button,
-.phraseEditor button,
+.phraseEditor button:not(.segmentButton),
 .phraseItem button,
-.exclusionEditor button,
+.exclusionEditor button:not(.segmentButton),
 .exclusionItem button {
   min-height: 28px;
   padding: 0 10px;
@@ -478,15 +575,46 @@ button {
   font-size: 12px;
 }
 
-.settingRow button:hover,
+.settingRow button:not(.sourceToggle):not(.segmentButton):hover,
 .aiConfigLine button:hover,
-.customCommandEditor button:hover,
+.customCommandEditor button:not(.segmentButton):hover,
 .customCommandItem button:hover,
-.phraseEditor button:hover,
+.phraseEditor button:not(.segmentButton):hover,
 .phraseItem button:hover,
-.exclusionEditor button:hover,
+.exclusionEditor button:not(.segmentButton):hover,
 .exclusionItem button:hover {
-  background: var(--color-accent-hover);
+  background: var(--color-accent-strong);
+  color: var(--color-panel);
+}
+
+/* Delete in the list editors uses the danger palette so it's clearly set apart
+   from the neutral "编辑" action and reads as the destructive one. */
+.customCommandItem button.dangerButton,
+.phraseItem button.dangerButton,
+.exclusionItem button.dangerButton {
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+}
+
+.customCommandItem button.dangerButton:hover,
+.phraseItem button.dangerButton:hover,
+.exclusionItem button.dangerButton:hover {
+  background: var(--color-danger-hover);
+  color: var(--color-danger);
+}
+
+/* "取消" in the editor rows is a neutral, non-committal action. */
+.customCommandEditor button.secondaryButton,
+.phraseEditor button.secondaryButton,
+.exclusionEditor button.secondaryButton {
+  background: var(--color-surface);
+  color: var(--color-muted-text);
+}
+
+.customCommandEditor button.secondaryButton:hover,
+.phraseEditor button.secondaryButton:hover,
+.exclusionEditor button.secondaryButton:hover {
+  background: var(--color-accent-soft);
   color: var(--color-text);
 }
 
@@ -649,6 +777,14 @@ button {
   gap: 8px;
 }
 
+/* Save + cancel share the editor's trailing column so adding the cancel button
+   doesn't push the row to a second line. */
+.editorActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .segmentedControl {
   min-width: 0;
   display: grid;
@@ -663,20 +799,31 @@ button {
 .segmentButton {
   min-height: 22px;
   padding: 0 6px;
+  border: 1px solid transparent;
   border-radius: 4px;
   background: transparent;
   color: var(--color-muted-text);
   cursor: pointer;
   font-size: 11px;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
-.segmentButton:hover,
-.segmentButton.active {
-  background: var(--color-panel);
+/* Hover is a soft hint that stays weaker than the selected segment. */
+.segmentButton:hover {
+  background: var(--color-surface-subtle);
   color: var(--color-text);
 }
 
+/* Selected segment is the strongest: accent-soft fill + accent border, matching
+   the sourceToggle selected treatment so the whole settings page reads the same
+   (not a white panel fill, which looked unselected next to the toggles). */
 .segmentButton.active {
+  background: var(--color-accent-soft);
+  border-color: var(--color-accent);
+  color: var(--color-text);
   font-weight: 700;
 }
 
@@ -830,7 +977,7 @@ button {
   align-items: center;
   gap: 6px;
   padding: 4px 5px 4px 7px;
-  border: 1px solid rgba(41, 57, 74, 0.08);
+  border: 1px solid var(--border-ink-soft);
   border-radius: 5px;
   background: var(--color-panel);
 }
@@ -1011,21 +1158,36 @@ button {
 .sourceToggle {
   min-height: 26px;
   padding: 0 6px;
+  border: 1px solid transparent;
   border-radius: 5px;
   background: var(--color-surface);
   color: var(--color-muted-text);
   cursor: pointer;
   font-size: 12px;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
+/* Selected state is the strongest: solid accent border + tinted fill, so it
+   clearly out-ranks a hovered-but-unselected toggle. */
 .sourceToggle.active {
   background: var(--color-accent-soft);
+  border-color: var(--color-accent);
   color: var(--color-text);
   font-weight: 700;
 }
 
+/* Hover on an unselected toggle is a soft hint that must stay weaker than the
+   selected state, so it nudges to surface-subtle rather than a deeper blue. */
 .sourceToggle:hover {
-  background: var(--color-accent-hover);
+  background: var(--color-surface-subtle);
+  color: var(--color-text);
+}
+
+.sourceToggle.active:hover {
+  background: var(--color-accent-soft);
 }
 
 .sourceToggle.dangerToggle {
@@ -1055,7 +1217,7 @@ button {
   width: 100%;
   min-width: 0;
   height: 26px;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 5px;
   background: var(--color-panel);
   color: var(--color-text);
@@ -1065,7 +1227,7 @@ button {
 }
 
 .weightInput input:focus {
-  border-color: rgba(99, 139, 195, 0.56);
+  border-color: var(--ring-accent);
 }
 
 .selectionAssistantShell {
@@ -1098,7 +1260,7 @@ button {
   padding: 7px 32px 7px 7px;
   box-shadow:
     0 12px 28px rgba(41, 57, 74, 0.16),
-    0 2px 7px rgba(41, 57, 74, 0.08);
+    0 2px 7px var(--border-ink-soft);
 }
 
 .selectionPickerActions {
@@ -1243,7 +1405,7 @@ button {
   padding: 4px;
   box-shadow:
     0 10px 24px rgba(41, 57, 74, 0.16),
-    0 2px 7px rgba(41, 57, 74, 0.08);
+    0 2px 7px var(--border-ink-soft);
   transform-origin: top right;
   animation: selectionMenuDrop 110ms ease-out;
 }
@@ -1293,7 +1455,7 @@ button {
   color: var(--color-text);
   box-shadow:
     0 14px 30px rgba(41, 57, 74, 0.16),
-    0 2px 8px rgba(41, 57, 74, 0.08);
+    0 2px 8px var(--border-ink-soft);
 }
 
 .selectionTodoPanel {
@@ -1451,7 +1613,7 @@ button {
   background: var(--color-background);
   box-shadow:
     0 18px 42px rgba(41, 57, 74, 0.18),
-    0 2px 8px rgba(41, 57, 74, 0.08);
+    0 2px 8px var(--border-ink-soft);
 }
 
 .selectionAssistantHeader {
@@ -1520,7 +1682,7 @@ button {
   align-items: start;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+  border-bottom: 1px solid var(--border-ink-soft);
   background: var(--color-surface-subtle);
 }
 
@@ -1546,7 +1708,7 @@ button {
   gap: 6px;
   overflow-x: auto;
   padding: 8px 10px;
-  border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+  border-bottom: 1px solid var(--border-ink-soft);
   background: var(--color-background);
 }
 
@@ -1562,7 +1724,7 @@ button {
 .selectionActionTabs select {
   min-width: 86px;
   height: 26px;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 5px;
   background: var(--color-panel);
   color: var(--color-text);
@@ -1572,7 +1734,7 @@ button {
 }
 
 .selectionActionTabs select:focus {
-  border-color: rgba(99, 139, 195, 0.56);
+  border-color: var(--ring-accent);
 }
 
 .selectionModelBar {
@@ -1581,7 +1743,7 @@ button {
   grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
   gap: 8px;
   padding: 7px 10px;
-  border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+  border-bottom: 1px solid var(--border-ink-soft);
   background: var(--color-surface);
 }
 
@@ -1589,7 +1751,7 @@ button {
   width: 100%;
   min-width: 0;
   height: 28px;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 5px;
   background: var(--color-panel);
   color: var(--color-text);
@@ -1599,7 +1761,7 @@ button {
 }
 
 .selectionModelBar select:focus {
-  border-color: rgba(99, 139, 195, 0.56);
+  border-color: var(--ring-accent);
 }
 
 .selectionModelMissing {
@@ -1609,7 +1771,7 @@ button {
   justify-content: space-between;
   gap: 8px;
   padding: 7px 10px;
-  border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+  border-bottom: 1px solid var(--border-ink-soft);
   background: var(--color-danger-soft);
 }
 
@@ -1707,7 +1869,7 @@ button {
   min-width: 0;
   height: 48px;
   resize: none;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 6px;
   background: var(--color-panel);
   color: var(--color-text);
@@ -1718,7 +1880,7 @@ button {
 }
 
 .selectionComposer textarea:focus {
-  border-color: rgba(99, 139, 195, 0.56);
+  border-color: var(--ring-accent);
 }
 
 .selectionResizeHandle {
@@ -1775,7 +1937,7 @@ button {
   gap: 3px;
   overflow: hidden;
   padding: 7px;
-  border-right: 1px solid rgba(41, 57, 74, 0.08);
+  border-right: 1px solid var(--border-ink-soft);
   background: var(--color-surface);
 }
 
@@ -1792,13 +1954,17 @@ button {
   text-align: left;
 }
 
-.slashBoardScope:hover,
-.slashBoardScope.active {
-  background: var(--color-panel);
+/* Hover is a soft hint on the surface tone. */
+.slashBoardScope:hover {
+  background: var(--color-surface);
   color: var(--color-text);
 }
 
+/* The active scope is the authoritative state: accent-soft fill plus the inset
+   accent bar, so it clearly out-ranks a merely-hovered scope. */
 .slashBoardScope.active {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
   box-shadow: inset 3px 0 0 var(--color-accent);
 }
 
@@ -1827,7 +1993,7 @@ button {
   align-items: center;
   gap: 8px;
   padding: 5px 8px 5px 10px;
-  border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+  border-bottom: 1px solid var(--border-ink-soft);
   background: var(--color-surface-subtle);
 }
 
@@ -1921,7 +2087,7 @@ button {
 
 .resultList {
   min-height: 0;
-  max-height: 190px;
+  max-height: 320px;
   overflow: auto;
   padding: 6px 6px 18px;
   border: 0;
@@ -2140,7 +2306,25 @@ button {
 .aiEmptyState button:hover,
 .aiMessage button:hover,
 .aiComposer button:hover {
-  background: var(--color-accent-hover);
+  background: var(--color-accent-strong);
+  color: var(--color-panel);
+}
+
+.aiSidebarHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Returning to search is benign, so the close button stays neutral instead of
+   competing with the accent-filled "设置" action next to it. */
+.aiSidebarHeader button.aiSidebarClose {
+  background: var(--color-surface);
+  color: var(--color-muted-text);
+}
+
+.aiSidebarHeader button.aiSidebarClose:hover {
+  background: var(--color-accent-soft);
   color: var(--color-text);
 }
 
@@ -2390,33 +2574,246 @@ button {
   min-height: 0;
   display: grid;
   align-content: start;
-  gap: 10px;
+  gap: 12px;
   overflow: auto;
-  padding: 12px 14px;
+  padding: 14px 16px;
 }
 
+/* Each message is a column whose content aligns to one side: assistant replies
+   hug the left, the user's messages hug the right, so the conversation reads as
+   a back-and-forth instead of a stack of identical full-width cards. */
 .aiMessage {
   min-width: 0;
   display: grid;
-  gap: 6px;
-  padding: 9px 11px;
-  border: 1px solid var(--color-border);
-  border-radius: 7px;
-  background: var(--color-panel);
+  gap: 4px;
+  justify-items: start;
 }
 
 .aiMessage.user {
+  justify-items: end;
+}
+
+.aiMessageHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px;
+}
+
+.aiMessageHeader strong {
+  color: var(--color-muted-text);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* The delete control stays hidden until the row is hovered or focused, so it
+   doesn't clutter the reading flow or invite accidental clicks. */
+.aiMessageDelete {
+  background: transparent;
+  color: var(--color-muted-text);
+  cursor: pointer;
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 120ms ease-out, color 120ms ease-out;
+}
+
+.aiMessage:hover .aiMessageDelete,
+.aiMessage:focus-within .aiMessageDelete {
+  opacity: 1;
+}
+
+.aiMessageDelete:hover {
+  color: var(--color-danger);
+}
+
+.aiMessageBubble {
+  min-width: 0;
+  max-width: 86%;
+  display: grid;
+  gap: 6px;
+  padding: 9px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-panel);
+}
+
+/* Asymmetric corner ties each bubble to its side's "tail". */
+.aiMessage.assistant .aiMessageBubble {
+  border-top-left-radius: 4px;
+}
+
+.aiMessage.user .aiMessageBubble {
+  border-top-right-radius: 4px;
   border-color: rgba(99, 139, 195, 0.32);
   background: var(--color-accent-soft);
 }
 
-.aiMessage p {
+.aiMessageBubble p {
   margin: 0;
   color: var(--color-text);
   font-size: 13px;
   line-height: 1.45;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+/* Markdown rendering for assistant replies */
+.mdRoot {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-text);
+}
+
+.mdParagraph {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.mdHeading {
+  margin: 2px 0 0;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.mdList {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 3px;
+}
+
+.mdList li {
+  overflow-wrap: anywhere;
+}
+
+.mdQuote {
+  margin: 0;
+  padding: 4px 10px;
+  border-left: 3px solid var(--color-border);
+  color: var(--color-muted-text);
+  white-space: pre-wrap;
+}
+
+.mdRule {
+  margin: 2px 0;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.mdInlineCode {
+  font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+}
+
+.mdLink {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: text;
+  word-break: break-all;
+}
+
+.mdCodeBlock {
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+  overflow: hidden;
+  background: var(--color-surface-subtle);
+}
+
+.mdCodeBlockHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 6px 3px 10px;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.mdCodeLang {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-muted-text);
+}
+
+.mdCodeCopy {
+  min-height: 20px;
+  padding: 0 8px;
+  border-radius: 4px;
+  border: 1px solid var(--color-border);
+  background: var(--color-panel);
+  color: var(--color-muted-text);
+  font-size: 11px;
+  cursor: pointer;
+  transition:
+    background 120ms ease-out,
+    color 120ms ease-out;
+}
+
+.mdCodeCopy:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
+.mdCodeBlock pre {
+  margin: 0;
+  padding: 9px 10px;
+  overflow-x: auto;
+}
+
+.mdCodeBlock code {
+  font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text);
+  white-space: pre;
+}
+
+/* Streaming "typing" indicator: three pulsing dots */
+.aiTypingIndicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 16px;
+}
+
+.aiTypingIndicator span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-muted-text);
+  opacity: 0.4;
+  animation: aiTypingPulse 1.1s ease-in-out infinite;
+}
+
+.aiTypingIndicator span:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.aiTypingIndicator span:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@keyframes aiTypingPulse {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 0.9;
+    transform: translateY(-2px);
+  }
 }
 
 .aiMessage small,
@@ -2430,6 +2827,7 @@ button {
   min-height: 84px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
   gap: 8px;
   padding: 10px 14px 12px;
   border-top: 1px solid var(--color-border);
@@ -2441,7 +2839,7 @@ button {
   width: 100%;
   min-width: 0;
   resize: none;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 6px;
   background: var(--color-panel);
   color: var(--color-text);
@@ -2452,7 +2850,11 @@ button {
 }
 
 .aiComposer textarea {
-  height: 60px;
+  /* Auto-grows via JS (autoGrowTextarea) between these bounds, so short drafts
+     stay compact and long ones expand without an inner scroll until the cap. */
+  min-height: 60px;
+  max-height: 168px;
+  overflow-y: auto;
 }
 
 .aiPromptInput {
@@ -2461,7 +2863,7 @@ button {
 
 .aiComposer textarea:focus,
 .aiPromptInput:focus {
-  border-color: rgba(99, 139, 195, 0.56);
+  border-color: var(--ring-accent);
 }
 
 .aiStreamToggle {
@@ -2471,7 +2873,7 @@ button {
   align-items: center;
   gap: 6px;
   padding: 0 8px;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 5px;
   background: var(--color-panel);
   color: var(--color-text);
@@ -2544,7 +2946,7 @@ button {
   width: 100%;
   min-width: 0;
   height: 26px;
-  border: 1px solid rgba(41, 57, 74, 0.10);
+  border: 1px solid var(--border-ink);
   border-radius: 5px;
   background: var(--color-panel);
   color: var(--color-text);
@@ -2555,7 +2957,7 @@ button {
 
 .aiSettingsItem input:focus,
 .aiSettingsItem select:focus {
-  border-color: rgba(99, 139, 195, 0.56);
+  border-color: var(--ring-accent);
 }
 
 .aiSettingsItem span {
@@ -2613,6 +3015,7 @@ button {
 
 
 .resultItem {
+  position: relative;
   width: 100%;
   min-height: 48px;
   display: grid;
@@ -2625,12 +3028,31 @@ button {
   color: var(--color-text);
   cursor: pointer;
   text-align: left;
+  transition:
+    background 120ms ease-out,
+    box-shadow 120ms ease-out;
 }
 
-.resultItem:hover,
-.resultItem.selected,
-.resultItem:focus-visible {
+/* Hover is a soft hint. */
+.resultItem:hover {
+  background: var(--color-surface);
+}
+
+/* Keyboard selection is the strong, authoritative state: it shows which row
+   Enter will fire, so it must clearly out-rank a hovered row. */
+.resultItem.selected {
   background: var(--color-accent-soft);
+}
+
+.resultItem.selected::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--color-accent);
 }
 
 .resultItem:focus-visible {
@@ -2644,7 +3066,7 @@ button {
   position: relative;
   display: grid;
   place-items: center;
-  border: 1px solid rgba(41, 57, 74, 0.08);
+  border: 1px solid var(--border-ink-soft);
   border-radius: 7px;
   background: var(--color-panel);
   color: var(--color-accent);
@@ -2658,18 +3080,30 @@ button {
 }
 
 .resultIconImage {
-  width: 100%;
-  height: 100%;
+  position: absolute;
+  inset: 3px;
+  width: calc(100% - 6px);
+  height: calc(100% - 6px);
   display: block;
   object-fit: contain;
+  opacity: 0;
+  transition: opacity 140ms ease-out;
 }
 
-.loadingResultIconImage {
-  position: absolute;
-  width: 0;
-  height: 0;
+.resultIconImage.visible {
+  opacity: 1;
+}
+
+.resultIconBadge {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  transition: opacity 140ms ease-out;
+}
+
+.resultIconBadge.hidden {
   opacity: 0;
-  pointer-events: none;
 }
 
 .resultText {
@@ -2734,6 +3168,38 @@ button {
   background: var(--color-accent-soft);
 }
 
+/* "More actions" affordance: a faint ⋯ that surfaces on row hover/selection,
+   so the context menu (Shift+Enter / right-click) is discoverable instead of
+   hidden. Kept invisible otherwise to keep the result list clean. */
+.resultMoreButton {
+  width: 24px;
+  min-height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--color-muted-text);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0;
+  transition:
+    opacity 120ms ease-out,
+    background 120ms ease-out,
+    color 120ms ease-out;
+}
+
+.resultItem:hover .resultMoreButton,
+.resultItem.selected .resultMoreButton,
+.resultItem:focus-within .resultMoreButton {
+  opacity: 1;
+}
+
+.resultMoreButton:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
 .emptyState {
   min-height: 92px;
   display: grid;
@@ -2741,8 +3207,6 @@ button {
   color: var(--color-muted-text);
   font-size: 13px;
 }
-
-
 
 
 @media (max-width: 520px) {
@@ -2765,7 +3229,11 @@ button {
     align-content: start;
     overflow-x: auto;
     border-right: 0;
-    border-bottom: 1px solid rgba(41, 57, 74, 0.08);
+    border-bottom: 1px solid var(--border-ink-soft);
+  }
+
+  .settingsCloseButton {
+    grid-column: 1 / -1;
   }
 
   .settingsNavItem {
@@ -2774,7 +3242,7 @@ button {
   }
 
   .settingsContent {
-    padding: 48px 12px 12px;
+    padding: 12px;
   }
 
   .settingsHeader small {
