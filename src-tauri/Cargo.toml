@@ -1,6 +1,6 @@
 [package]
 name = "easy-launcher"
-version = "0.2.1"
+version = "0.2.2"
 description = "A Windows-first desktop launcher"
 authors = ["Easy Launcher Contributors"]
 edition = "2021"
