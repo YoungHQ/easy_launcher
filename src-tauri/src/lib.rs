@@ -49,9 +49,9 @@ use storage::{
     CustomCommandInput, ExclusionRule, ExclusionRuleInput, Phrase, PhraseInput, PinnedResult,
     PinnedResultInput, ResultAlias, ResultAliasInput, SelectionMark, SelectionMarkInput, Todo,
     TodoInput, TodoUpdateInput, WebSearchTemplate, WebSearchTemplateInput,
-    TRANSLATION_AI_ASSISTANT_ID,
+    SELECTION_MARK_LIMIT_SETTING_KEY, TRANSLATION_AI_ASSISTANT_ID,
 };
-use storage::{Storage, StorageState, StorageStatus};
+use storage::{validate_selection_mark_limit, Storage, StorageState, StorageStatus};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -94,8 +94,8 @@ const SEARCH_WINDOW_WIDTH: u32 = 728;
 const SEARCH_WINDOW_HEIGHT: u32 = 286;
 const SETTINGS_WINDOW_WIDTH: u32 = 960;
 const SETTINGS_WINDOW_HEIGHT: u32 = 700;
-const AI_WINDOW_WIDTH: u32 = 760;
-const AI_WINDOW_HEIGHT: u32 = 640;
+const AI_WINDOW_WIDTH: u32 = 1040;
+const AI_WINDOW_HEIGHT: u32 = 680;
 const SELECTION_PICKER_WINDOW_WIDTH: u32 = 520;
 const SELECTION_PICKER_WINDOW_HEIGHT: u32 = 52;
 const SELECTION_RESULT_WINDOW_WIDTH: u32 = 520;
@@ -115,6 +115,7 @@ const EXPORTABLE_SETTING_KEYS: &[&str] = &[
     "ai.shortcut",
     "selection.enabled",
     "selection.trigger.mode",
+    "selection.mark.limit",
     "file.editor.path",
     "folder.editor.path",
     "ui.language",
@@ -757,6 +758,18 @@ fn clear_selection_marks(storage: tauri::State<'_, StorageState>) -> Result<usiz
         .lock()
         .map_err(|_| "无法清空划词记录".to_string())?
         .clear_selection_marks()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_selection_mark_limit(
+    limit: usize,
+    storage: tauri::State<'_, StorageState>,
+) -> Result<usize, String> {
+    storage
+        .lock()
+        .map_err(|_| "无法保存划词记录上限".to_string())?
+        .set_selection_mark_limit(limit)
         .map_err(|error| error.to_string())
 }
 
@@ -3868,6 +3881,13 @@ fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
                 Err("selection.trigger.mode 只能是 ctrl_mouse".into())
             }
         }
+        SELECTION_MARK_LIMIT_SETTING_KEY => {
+            let limit = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "selection.mark.limit 必须是整数".to_string())?;
+            validate_selection_mark_limit(limit)
+        }
         "ui.language" => {
             if matches!(value.trim(), "system" | "zh-CN" | "en-US") {
                 Ok(())
@@ -4434,8 +4454,9 @@ fn hide_window_to_tray(window: &tauri::WebviewWindow) {
     // Remember where the launcher is before hiding (Esc, shortcut toggle, tray),
     // so re-summoning it — including after a full restart — keeps the user's
     // position instead of falling back to the default placement.
-    if let Some(launcher_position) =
-        window.app_handle().try_state::<LauncherWindowPositionStore>()
+    if let Some(launcher_position) = window
+        .app_handle()
+        .try_state::<LauncherWindowPositionStore>()
     {
         store_launcher_position(window, launcher_position.inner());
     }
@@ -4502,7 +4523,10 @@ fn default_launcher_position(window: &tauri::WebviewWindow) -> Option<PhysicalPo
         .unwrap_or(PhysicalSize::new(SEARCH_WINDOW_WIDTH, SEARCH_WINDOW_HEIGHT));
     let x = monitor_pos.x + (monitor_size.width as i32 - window_size.width as i32) / 2;
     let y = monitor_pos.y + (monitor_size.height as i32 * 58 / 100 - window_size.height as i32 / 2);
-    Some(PhysicalPosition::new(x.max(monitor_pos.x), y.max(monitor_pos.y)))
+    Some(PhysicalPosition::new(
+        x.max(monitor_pos.x),
+        y.max(monitor_pos.y),
+    ))
 }
 
 fn restore_search_window(
@@ -4614,7 +4638,10 @@ fn show_ai_panel(app: &AppHandle) {
     set_settings_panel_open(app, false);
     if let Some(window) = app.get_webview_window("main") {
         disable_native_window_frame(&window);
-        let _ = window.set_size(PhysicalSize::new(AI_WINDOW_WIDTH, AI_WINDOW_HEIGHT));
+        let _ = window.set_size(LogicalSize::new(
+            AI_WINDOW_WIDTH as f64,
+            AI_WINDOW_HEIGHT as f64,
+        ));
         let _ = window.center();
         let _ = app.emit(AI_OPENED_EVENT, ());
         disable_native_window_frame(&window);
@@ -5149,6 +5176,7 @@ pub fn run() {
             save_selection_mark,
             delete_selection_mark,
             clear_selection_marks,
+            set_selection_mark_limit,
             list_todos,
             save_todo,
             update_todo,
@@ -5352,6 +5380,16 @@ mod tests {
         assert!(EXPORTABLE_SETTING_KEYS.contains(&"search.weight.ai"));
         assert!(EXPORTABLE_SETTING_KEYS.contains(&"search.weight.phrase"));
         assert!(EXPORTABLE_SETTING_KEYS.contains(&"search.weight.web_search"));
+    }
+
+    #[test]
+    fn selection_mark_limit_export_and_import_validation_are_supported() {
+        assert!(EXPORTABLE_SETTING_KEYS.contains(&"selection.mark.limit"));
+        assert!(validate_import_setting("selection.mark.limit", "50").is_ok());
+        assert!(validate_import_setting("selection.mark.limit", "5000").is_ok());
+        assert!(validate_import_setting("selection.mark.limit", "49").is_err());
+        assert!(validate_import_setting("selection.mark.limit", "5001").is_err());
+        assert!(validate_import_setting("selection.mark.limit", "not-a-number").is_err());
     }
 
     #[test]

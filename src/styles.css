@@ -215,6 +215,32 @@ button {
   white-space: nowrap;
 }
 
+.todoDraftPanel {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+  padding: 10px 12px 12px;
+  border-bottom: 1px solid var(--border-ink-soft);
+  background: var(--color-background);
+}
+
+.todoDraftTextInput {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  border: 1px solid var(--border-ink);
+  border-radius: 6px;
+  background: var(--color-panel);
+  color: var(--color-text);
+  padding: 0 9px;
+  font-size: 13px;
+  outline: 0;
+}
+
+.todoDraftTextInput:focus {
+  border-color: var(--ring-accent);
+}
+
 .errorNotice {
   min-height: 42px;
   display: grid;
@@ -973,7 +999,7 @@ button {
   min-height: 30px;
   min-width: 0;
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) auto;
+  grid-template-columns: 24px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 6px;
   padding: 4px 5px 4px 7px;
@@ -1014,6 +1040,36 @@ button {
   color: var(--color-text);
   font-size: 12px;
   font-weight: 800;
+}
+
+.slashBoardSettingsActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.slashBoardSettingsActions button {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  background: var(--color-surface);
+  color: var(--color-muted-text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.slashBoardSettingsActions button:hover:not(:disabled),
+.slashBoardSettingsActions button:focus-visible {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+  outline: 0;
+}
+
+.slashBoardSettingsActions button:disabled {
+  cursor: default;
+  opacity: 0.38;
 }
 
 .slashBoardSettingsHandle {
@@ -2526,10 +2582,82 @@ button {
 }
 
 .aiChatHeader {
-  min-height: 48px;
+  min-height: 76px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
   padding: 9px 14px;
   border-bottom: 1px solid var(--color-border);
   background: var(--color-panel);
+}
+
+.aiChatTitle,
+.aiChatHeaderActions,
+.aiChatModelSelect {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.aiChatTitle {
+  width: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.aiChatHeaderActions {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(112px, 0.72fr) minmax(180px, 1fr) minmax(108px, 0.7fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.aiChatModelSelect {
+  width: 100%;
+  gap: 5px;
+  color: var(--color-muted-text);
+  font-size: 11px;
+}
+
+.aiChatConversationControl {
+  min-width: 0;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.aiChatConversationControl button,
+.aiChatConversationControl input,
+.aiChatConversationControl small {
+  width: 100%;
+}
+
+.aiChatModelSelect span {
+  flex: 0 0 auto;
+}
+
+.aiChatModelSelect select {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  border: 1px solid var(--border-ink);
+  border-radius: 5px;
+  background: var(--color-panel);
+  color: var(--color-text);
+  padding: 0 7px;
+  font-size: 11px;
+  outline: 0;
+}
+
+.aiChatModelSelect select:focus {
+  border-color: var(--ring-accent);
+}
+
+.aiChatModelSelect select:disabled {
+  color: var(--color-muted-text);
+  opacity: 0.7;
 }
 
 .aiChatHeader small {
@@ -2558,7 +2686,7 @@ button {
 }
 
 .aiChatHeader input {
-  width: min(260px, 50%);
+  width: 100%;
   min-width: 0;
   height: 24px;
   border: 1px solid rgba(99, 139, 195, 0.42);
@@ -3196,6 +3324,34 @@ button {
 }
 
 .resultMoreButton:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
+.resultPinButton {
+  min-height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--border-ink-soft);
+  border-radius: 5px;
+  background: var(--color-panel);
+  color: var(--color-muted-text);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  transition:
+    background 120ms ease-out,
+    border-color 120ms ease-out,
+    color 120ms ease-out;
+}
+
+.resultPinButton:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
+.resultPinButton.active {
+  border-color: var(--color-accent);
   background: var(--color-accent-soft);
   color: var(--color-text);
 }

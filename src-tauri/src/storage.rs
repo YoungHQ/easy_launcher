@@ -13,7 +13,10 @@ pub type StorageState = Arc<Mutex<Storage>>;
 const APP_DATA_DIR: &str = "EasyLauncher";
 const WEB_SEARCH_QUERY_PLACEHOLDER: &str = "{query}";
 const SELECTION_MARK_TEXT_MAX_CHARS: usize = 20_000;
-const SELECTION_MARK_STORAGE_LIMIT: usize = 500;
+pub const SELECTION_MARK_LIMIT_SETTING_KEY: &str = "selection.mark.limit";
+pub const SELECTION_MARK_LIMIT_MIN: usize = 50;
+pub const SELECTION_MARK_LIMIT_DEFAULT: usize = 500;
+pub const SELECTION_MARK_LIMIT_MAX: usize = 5_000;
 const TODO_TEXT_MAX_CHARS: usize = 20_000;
 pub const DEFAULT_AI_MODEL_PROFILE_ID: &str = "default-openai-compatible";
 pub const DEFAULT_AI_PROVIDER_ID: &str = "default-openai-compatible-provider";
@@ -111,6 +114,7 @@ pub struct SelectionMark {
     pub text: String,
     pub source_app: Option<String>,
     pub created_at: String,
+    pub last_used_at: String,
     pub use_count: i64,
 }
 
@@ -641,8 +645,8 @@ impl Storage {
 
     pub fn pinned_result_scores(&self) -> Result<HashMap<String, f32>, StorageError> {
         let mut scores = HashMap::new();
-        for result in self.list_pinned_results()? {
-            scores.insert(result.result_id, 0.65);
+        for (index, result) in self.list_pinned_results()?.into_iter().enumerate() {
+            scores.insert(result.result_id, 0.65 - (index.min(1000) as f32 * 0.00001));
         }
         Ok(scores)
     }
@@ -986,7 +990,7 @@ impl Storage {
 
     pub fn list_selection_marks(&self) -> Result<Vec<SelectionMark>, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, text, source_app, created_at, use_count
+            "SELECT id, text, source_app, created_at, last_used_at, use_count
              FROM selection_marks
              ORDER BY created_at DESC, id DESC",
         )?;
@@ -1004,10 +1008,11 @@ impl Storage {
         &self,
         input: SelectionMarkInput,
     ) -> Result<SelectionMark, StorageError> {
-        self.save_selection_mark_with_limit(input, SELECTION_MARK_STORAGE_LIMIT)
+        let limit = self.selection_mark_limit()?;
+        self.save_selection_mark_with_limit(input, limit)
     }
 
-    fn save_selection_mark_with_limit(
+    pub(crate) fn save_selection_mark_with_limit(
         &self,
         input: SelectionMarkInput,
         limit: usize,
@@ -1018,8 +1023,15 @@ impl Storage {
         let id = generated_record_id("mark");
 
         self.connection.execute(
-            "INSERT INTO selection_marks (id, text, source_app, created_at, use_count)
-             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 0)",
+            "INSERT INTO selection_marks (id, text, source_app, created_at, last_used_at, use_count)
+             VALUES (
+                ?1,
+                ?2,
+                ?3,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                0
+             )",
             params![id, text, source_app],
         )?;
         self.prune_selection_marks(limit)?;
@@ -1043,7 +1055,8 @@ impl Storage {
     pub fn mark_selection_mark_used(&self, id: &str) -> Result<(), StorageError> {
         self.connection.execute(
             "UPDATE selection_marks
-             SET use_count = use_count + 1
+             SET use_count = use_count + 1,
+                 last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![id],
         )?;
@@ -1054,7 +1067,7 @@ impl Storage {
     pub fn get_selection_mark(&self, id: &str) -> Result<Option<SelectionMark>, StorageError> {
         self.connection
             .query_row(
-                "SELECT id, text, source_app, created_at, use_count
+                "SELECT id, text, source_app, created_at, last_used_at, use_count
                  FROM selection_marks
                  WHERE id = ?1",
                 params![id],
@@ -1064,10 +1077,23 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
-    fn prune_selection_marks(&self, limit: usize) -> Result<(), StorageError> {
+    pub fn selection_mark_limit(&self) -> Result<usize, StorageError> {
+        let value = self.get_setting(SELECTION_MARK_LIMIT_SETTING_KEY)?;
+        Ok(parse_selection_mark_limit(value.as_deref()).unwrap_or(SELECTION_MARK_LIMIT_DEFAULT))
+    }
+
+    pub fn set_selection_mark_limit(&self, limit: usize) -> Result<usize, StorageError> {
+        validate_selection_mark_limit(limit).map_err(StorageError::Validation)?;
+        self.set_setting(SELECTION_MARK_LIMIT_SETTING_KEY, &limit.to_string())?;
+        self.prune_selection_marks(limit)
+    }
+
+    pub fn prune_selection_marks(&self, limit: usize) -> Result<usize, StorageError> {
         if limit == 0 {
-            self.connection.execute("DELETE FROM selection_marks", [])?;
-            return Ok(());
+            return self
+                .connection
+                .execute("DELETE FROM selection_marks", [])
+                .map_err(StorageError::from);
         }
 
         let count =
@@ -1077,20 +1103,20 @@ impl Storage {
                 })?;
         let overflow = count - limit as i64;
         if overflow <= 0 {
-            return Ok(());
+            return Ok(0);
         }
 
-        self.connection.execute(
+        let affected = self.connection.execute(
             "DELETE FROM selection_marks
              WHERE id IN (
                 SELECT id
                 FROM selection_marks
-                ORDER BY created_at ASC, rowid ASC
+                ORDER BY last_used_at ASC, created_at ASC, rowid ASC
                 LIMIT ?1
              )",
             params![overflow],
         )?;
-        Ok(())
+        Ok(affected)
     }
 
     pub fn list_todos(
@@ -2274,6 +2300,7 @@ fn initialize_schema(connection: &Connection) -> Result<(), StorageError> {
             text TEXT NOT NULL,
             source_app TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            last_used_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             use_count INTEGER NOT NULL DEFAULT 0
         );
 
@@ -2416,9 +2443,45 @@ fn initialize_schema(connection: &Connection) -> Result<(), StorageError> {
          )",
         [],
     )?;
+    ensure_selection_mark_last_used_at_column(connection)?;
     migrate_ai_model_profiles_to_providers(connection)?;
 
     Ok(())
+}
+
+fn ensure_selection_mark_last_used_at_column(connection: &Connection) -> Result<(), StorageError> {
+    if table_column_exists(connection, "selection_marks", "last_used_at")? {
+        return Ok(());
+    }
+
+    connection.execute(
+        "ALTER TABLE selection_marks ADD COLUMN last_used_at TEXT",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE selection_marks
+         SET last_used_at = created_at
+         WHERE last_used_at IS NULL OR trim(last_used_at) = ''",
+        [],
+    )?;
+    Ok(())
+}
+
+fn table_column_exists(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, StorageError> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut statement = connection.prepare(&pragma)?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn migrate_ai_model_profiles_to_providers(connection: &Connection) -> Result<(), StorageError> {
@@ -2517,7 +2580,8 @@ fn selection_mark_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Selectio
         text: row.get(1)?,
         source_app: row.get(2)?,
         created_at: row.get(3)?,
-        use_count: row.get(4)?,
+        last_used_at: row.get(4)?,
+        use_count: row.get(5)?,
     })
 }
 
@@ -2768,6 +2832,22 @@ fn validate_selection_mark_text(text: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+pub fn parse_selection_mark_limit(value: Option<&str>) -> Option<usize> {
+    let limit = value?.trim().parse::<usize>().ok()?;
+    validate_selection_mark_limit(limit).ok()?;
+    Some(limit)
+}
+
+pub fn validate_selection_mark_limit(limit: usize) -> Result<(), String> {
+    if (SELECTION_MARK_LIMIT_MIN..=SELECTION_MARK_LIMIT_MAX).contains(&limit) {
+        Ok(())
+    } else {
+        Err(format!(
+            "划词记录上限必须在 {SELECTION_MARK_LIMIT_MIN} 到 {SELECTION_MARK_LIMIT_MAX} 之间"
+        ))
+    }
 }
 
 fn validate_todo_text(text: &str) -> Result<(), String> {
@@ -3103,6 +3183,7 @@ fn seed_defaults(connection: &Connection) -> Result<(), StorageError> {
         ("ai.shortcut", "Alt+3"),
         ("selection.enabled", "true"),
         ("selection.trigger.mode", "ctrl_mouse"),
+        (SELECTION_MARK_LIMIT_SETTING_KEY, "500"),
         ("file.editor.path", ""),
         ("folder.editor.path", ""),
         ("ui.language", "system"),
@@ -4196,14 +4277,12 @@ mod tests {
         storage
             .mark_selection_mark_used(&first.id)
             .expect("mark used");
-        assert_eq!(
-            storage
-                .get_selection_mark(&first.id)
-                .expect("get mark")
-                .expect("mark exists")
-                .use_count,
-            1
-        );
+        let used_first = storage
+            .get_selection_mark(&first.id)
+            .expect("get mark")
+            .expect("mark exists");
+        assert_eq!(used_first.use_count, 1);
+        assert!(used_first.last_used_at >= used_first.created_at);
         assert!(storage
             .delete_selection_mark(&first.id)
             .expect("delete mark"));
@@ -4283,6 +4362,71 @@ mod tests {
 
         assert!(!ids.contains(&first.id));
         assert!(ids.contains(&second.id));
+        assert!(ids.contains(&third.id));
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn selection_mark_limit_prunes_least_recently_used_records() {
+        let connection = Connection::open_in_memory().expect("open in-memory sqlite");
+        initialize_schema(&connection).expect("initialize schema");
+        let storage = Storage {
+            database_path: PathBuf::from("memory"),
+            connection,
+        };
+
+        let first = storage
+            .save_selection_mark_with_limit(
+                SelectionMarkInput {
+                    text: "first".into(),
+                    source_app: None,
+                },
+                10,
+            )
+            .expect("create first");
+        let second = storage
+            .save_selection_mark_with_limit(
+                SelectionMarkInput {
+                    text: "second".into(),
+                    source_app: None,
+                },
+                10,
+            )
+            .expect("create second");
+        let third = storage
+            .save_selection_mark_with_limit(
+                SelectionMarkInput {
+                    text: "third".into(),
+                    source_app: None,
+                },
+                10,
+            )
+            .expect("create third");
+
+        storage
+            .connection
+            .execute(
+                "UPDATE selection_marks
+                 SET last_used_at = CASE id
+                    WHEN ?1 THEN '2026-06-03T00:00:00.000Z'
+                    WHEN ?2 THEN '2026-06-01T00:00:00.000Z'
+                    ELSE '2026-06-02T00:00:00.000Z'
+                 END",
+                params![&first.id, &second.id],
+            )
+            .expect("set deterministic last used timestamps");
+
+        let pruned = storage.prune_selection_marks(2).expect("prune marks");
+        let ids = storage
+            .list_selection_marks()
+            .expect("list marks")
+            .into_iter()
+            .map(|mark| mark.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(pruned, 1);
+        assert!(ids.contains(&first.id));
+        assert!(!ids.contains(&second.id));
         assert!(ids.contains(&third.id));
         assert_eq!(ids.len(), 2);
     }

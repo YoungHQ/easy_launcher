@@ -111,6 +111,28 @@ type TodoReminderPayload = {
   overdue: boolean;
 };
 
+type SelectionMark = {
+  id: string;
+  text: string;
+  sourceApp?: string | null;
+  createdAt: string;
+  lastUsedAt: string;
+  useCount: number;
+};
+
+type TodoDraft = {
+  text: string;
+  preset: TodoTimePreset;
+  customDate: string;
+  customTime: string;
+  notice: string | null;
+  saving: boolean;
+};
+
+type TodoNewDraft = Pick<TodoDraft, "text" | "preset" | "customDate" | "customTime"> & {
+  hasReminderTime: boolean;
+};
+
 type SelectionTriggerMode = "ctrl_mouse";
 type ViewMode = "launcher" | "ai";
 type AiSettingsTab = "providers" | "assistants";
@@ -551,6 +573,9 @@ const SELECTION_PICKER_ACTION_LIMIT = 6;
 const SELECTION_PICKER_FIXED_ACTION_COUNT = 2;
 const SELECTION_PICKER_OVERFLOW_ACTION_COUNT = 1;
 const SELECTION_RESULT_PRIMARY_ACTION_LIMIT = 6;
+const SELECTION_MARK_LIMIT_MIN = 50;
+const SELECTION_MARK_LIMIT_DEFAULT = 500;
+const SELECTION_MARK_LIMIT_MAX = 5000;
 const TODO_SNOOZE_MINUTES = 10;
 const MODEL_BINDING_SEPARATOR = "::";
 const SEARCH_WINDOW_MIN_HEIGHT = 64;
@@ -649,6 +674,10 @@ function MainApp() {
   const [selectionTriggerMode, setSelectionTriggerMode] =
     useState<SelectionTriggerMode>("ctrl_mouse");
   const [selectionEnabled, setSelectionEnabled] = useState(true);
+  const [selectionMarkLimit, setSelectionMarkLimit] = useState(SELECTION_MARK_LIMIT_DEFAULT);
+  const [selectionMarkLimitInput, setSelectionMarkLimitInput] = useState(
+    String(SELECTION_MARK_LIMIT_DEFAULT),
+  );
   const [doubleAltEnabled, setDoubleAltEnabled] = useState(true);
   const [startupEnabled, setStartupEnabled] = useState(false);
   const [languageOption, setLanguageOption] = useState<LanguageOption>("system");
@@ -767,10 +796,12 @@ function MainApp() {
   const [isSearching, setIsSearching] = useState(false);
   const [appError, setAppError] = useState<AppError | null>(null);
   const [contextSession, setContextSession] = useState<ResultContextSession | null>(null);
+  const [todoDraft, setTodoDraft] = useState<TodoDraft | null>(null);
   const launcherRef = useRef<HTMLElement | null>(null);
   const windowSizeRef = useRef<{ width: number; height: number } | null>(null);
   const heightTweenRef = useRef<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const searchFocusTimerRef = useRef<number | null>(null);
   const resultItemRefs = useRef<Array<HTMLDivElement | null>>([]);
   const aiInputRef = useRef<HTMLTextAreaElement | null>(null);
   const latestSearchRequestId = useRef(0);
@@ -900,6 +931,32 @@ function MainApp() {
     aiProviders,
     enabledAiProviderModels,
   );
+  const selectedChatModelBinding = selectedAiAssistant
+    ? profileIdToModelBindingValue(
+        selectedAiAssistant.modelProfileId,
+        aiModelProfiles,
+        aiProviders,
+        enabledAiProviderModels,
+      )
+    : "";
+  const selectedChatModelBindingParts = parseModelBindingValue(selectedChatModelBinding);
+  const chatModelProviders = aiProviders.filter(
+    (provider) =>
+      provider.enabled && enabledAiProviderModels.some((model) => model.providerId === provider.id),
+  );
+  const selectedChatProviderId =
+    selectedChatModelBindingParts &&
+    chatModelProviders.some((provider) => provider.id === selectedChatModelBindingParts.providerId)
+      ? selectedChatModelBindingParts.providerId
+      : chatModelProviders[0]?.id ?? "";
+  const selectedChatProviderModels = enabledAiProviderModels.filter(
+    (model) => model.providerId === selectedChatProviderId,
+  );
+  const selectedChatModelName =
+    selectedChatModelBindingParts &&
+    selectedChatProviderModels.some((model) => model.modelName === selectedChatModelBindingParts.modelName)
+      ? selectedChatModelBindingParts.modelName
+      : selectedChatProviderModels[0]?.modelName ?? "";
   const visibleSelectionActions = aiSelectionActions.filter(
     (action) => action.showInSelection && action.assistantEnabled,
   );
@@ -1097,13 +1154,14 @@ function MainApp() {
   }
 
   function focusSearchInput() {
-    window.setTimeout(() => {
+    if (searchFocusTimerRef.current !== null) {
+      window.clearTimeout(searchFocusTimerRef.current);
+    }
+    searchFocusTimerRef.current = window.setTimeout(() => {
+      searchFocusTimerRef.current = null;
       searchInputRef.current?.focus();
       searchInputRef.current?.select();
     }, 0);
-    window.setTimeout(() => {
-      searchInputRef.current?.focus();
-    }, 80);
   }
 
   async function openSettingsPanel(
@@ -1169,12 +1227,26 @@ function MainApp() {
   }
 
   async function invokeSearchWithRecents(searchQuery: string, requestId = reserveSearchRequestId()) {
-    const response = await invoke<SearchResult[]>("search_with_recents", {
-      query: searchQuery,
-      requestId,
-    });
+    if (!isLatestSearchRequest(requestId)) {
+      return null;
+    }
 
-    return isLatestSearchRequest(requestId) ? response : null;
+    if (searchQuery.trim().length > 0) {
+      setIsSearching(true);
+    }
+
+    try {
+      const response = await invoke<SearchResult[]>("search_with_recents", {
+        query: searchQuery,
+        requestId,
+      });
+
+      return isLatestSearchRequest(requestId) ? response : null;
+    } finally {
+      if (isLatestSearchRequest(requestId)) {
+        setIsSearching(false);
+      }
+    }
   }
 
   async function invokeSlashBoardSearch(searchQuery: string) {
@@ -1322,6 +1394,12 @@ function MainApp() {
           key: "selection.enabled",
         });
         setSelectionEnabled(loadedSelectionEnabled !== "false");
+        const loadedSelectionMarkLimit = await invoke<string | null>("get_setting", {
+          key: "selection.mark.limit",
+        });
+        const normalizedSelectionMarkLimit = normalizeSelectionMarkLimit(loadedSelectionMarkLimit);
+        setSelectionMarkLimit(normalizedSelectionMarkLimit);
+        setSelectionMarkLimitInput(String(normalizedSelectionMarkLimit));
         const doubleAlt = await invoke<string | null>("get_setting", {
           key: "launcher.double_alt.enabled",
         });
@@ -1520,6 +1598,7 @@ function MainApp() {
         setContextSession(null);
         setSelectedIndex(0);
         setActionMessage("已返回搜索结果");
+        focusSearchInput();
         return;
       }
 
@@ -1636,6 +1715,10 @@ function MainApp() {
     }
 
     async function runSearch() {
+      if (!isLatestSearchRequest(requestId)) {
+        return;
+      }
+
       // Only show the progress bar for non-empty queries, so clearing the box
       // doesn't flash a loading state.
       if (searchQuery.trim().length > 0) {
@@ -1671,6 +1754,7 @@ function MainApp() {
       window.clearTimeout(timeoutId);
       if (latestSearchRequestId.current === requestId) {
         latestSearchRequestId.current += 1;
+        setIsSearching(false);
       }
     };
   }, [contextSession, query, slashBoardActive]);
@@ -1750,7 +1834,6 @@ function MainApp() {
       setAiConversations(conversations);
       const activeConversationId = conversations[0]?.id ?? null;
       setSelectedAiConversationId(activeConversationId);
-      const activeConversation = conversations[0] ?? null;
       if (activeConversationId) {
         setAiMessages(
           await invoke<AiMessage[]>("list_ai_messages", { conversationId: activeConversationId }),
@@ -2102,6 +2185,48 @@ function MainApp() {
       clearError();
     } catch (error) {
       showError("AI", "消息读取失败", error);
+    }
+  }
+
+  async function updateSelectedAiAssistantProvider(providerId: string) {
+    const firstModel = enabledAiProviderModels.find((model) => model.providerId === providerId);
+    if (!firstModel) {
+      showError("AI", "请选择可用模型");
+      return;
+    }
+    await updateSelectedAiAssistantModel(providerId, firstModel.modelName);
+  }
+
+  async function updateSelectedAiAssistantModel(providerId: string, modelName: string) {
+    if (!selectedAiAssistant || activeAiRequestId) {
+      return;
+    }
+    if (!providerId || !modelName) {
+      showError("AI", "请选择可用模型");
+      return;
+    }
+
+    try {
+      const assistant = await invoke<AiAssistant>("set_ai_assistant_model", {
+        assistantId: selectedAiAssistant.id,
+        providerId,
+        modelName,
+      });
+      setAiAssistants((current) =>
+        current.map((item) => (item.id === assistant.id ? assistant : item)),
+      );
+      setAiAssistantDraft((current) =>
+        current.id === assistant.id ? assistantToDraft(assistant) : current,
+      );
+      setActionMessage(`聊天模型已切换：${assistantModelSummary(
+        assistant,
+        aiModelProfiles,
+        aiProviders,
+        enabledAiProviderModels,
+      )}`);
+      clearError();
+    } catch (error) {
+      showError("AI", "聊天模型切换失败", error);
     }
   }
 
@@ -2469,6 +2594,12 @@ function MainApp() {
       key: "selection.enabled",
     });
     setSelectionEnabled(loadedSelectionEnabled !== "false");
+    const loadedSelectionMarkLimit = await invoke<string | null>("get_setting", {
+      key: "selection.mark.limit",
+    });
+    const normalizedSelectionMarkLimit = normalizeSelectionMarkLimit(loadedSelectionMarkLimit);
+    setSelectionMarkLimit(normalizedSelectionMarkLimit);
+    setSelectionMarkLimitInput(String(normalizedSelectionMarkLimit));
 
     const doubleAlt = await invoke<string | null>("get_setting", {
       key: "launcher.double_alt.enabled",
@@ -2907,6 +3038,48 @@ function MainApp() {
     }
   }
 
+  async function saveSelectionMarkLimit() {
+    const nextLimit = integerFromInput(selectionMarkLimitInput, selectionMarkLimit);
+    if (nextLimit < SELECTION_MARK_LIMIT_MIN || nextLimit > SELECTION_MARK_LIMIT_MAX) {
+      showError(
+        "配置",
+        `划词记录上限必须在 ${SELECTION_MARK_LIMIT_MIN} 到 ${SELECTION_MARK_LIMIT_MAX} 之间`,
+      );
+      return;
+    }
+
+    try {
+      const marks = await invoke<SelectionMark[]>("list_selection_marks");
+      if (
+        nextLimit < marks.length &&
+        !window.confirm(
+          `当前有 ${marks.length} 条划词记录，上限改为 ${nextLimit} 后会立即删除 ${marks.length - nextLimit} 条最久未使用记录。\n\n是否继续？`,
+        )
+      ) {
+        setSelectionMarkLimitInput(String(selectionMarkLimit));
+        return;
+      }
+
+      const pruned = await invoke<number>("set_selection_mark_limit", {
+        limit: nextLimit,
+      });
+      setSelectionMarkLimit(nextLimit);
+      setSelectionMarkLimitInput(String(nextLimit));
+      const response = await invokeSearchWithRecents(query);
+      if (response !== null) {
+        setSearchResults(response);
+      }
+      setActionMessage(
+        pruned > 0
+          ? `已保存划词记录上限：${nextLimit}，已裁剪 ${pruned} 条`
+          : `已保存划词记录上限：${nextLimit}`,
+      );
+      clearError();
+    } catch (error) {
+      showError("配置", "划词记录上限保存失败", error);
+    }
+  }
+
   async function clearCompletedTodos() {
     if (!window.confirm("清空已完成待办？\n\n未完成的提醒会保留。")) {
       return;
@@ -3038,6 +3211,33 @@ function MainApp() {
     const sourceIndex = slashBoardScopeSettings.findIndex((setting) => setting.id === sourceId);
     const targetIndex = slashBoardScopeSettings.findIndex((setting) => setting.id === targetId);
     if (sourceIndex < 0 || targetIndex < 0) {
+      return;
+    }
+
+    const nextSettings = [...slashBoardScopeSettings];
+    const [sourceSetting] = nextSettings.splice(sourceIndex, 1);
+    nextSettings.splice(targetIndex, 0, sourceSetting);
+    saveSlashBoardScopeSettings(nextSettings);
+  }
+
+  function moveSlashBoardScope(scopeId: SlashBoardScope, move: NavMove) {
+    const sourceIndex = slashBoardScopeSettings.findIndex((setting) => setting.id === scopeId);
+    if (sourceIndex < 0) {
+      return;
+    }
+
+    const lastIndex = slashBoardScopeSettings.length - 1;
+    const targetIndex =
+      move === "home"
+        ? 0
+        : move === "end"
+          ? lastIndex
+          : move === "up"
+            ? Math.max(0, sourceIndex - 1)
+            : move === "down"
+              ? Math.min(lastIndex, sourceIndex + 1)
+              : sourceIndex;
+    if (targetIndex === sourceIndex) {
       return;
     }
 
@@ -3426,6 +3626,8 @@ function MainApp() {
   }
 
   async function setResultPinned(result: SearchResult, pinned: boolean) {
+    const isMarkResult = result.id.startsWith("mark:");
+    const actionLabel = isMarkResult ? (pinned ? "置顶" : "取消置顶") : pinned ? "固定" : "取消固定";
     try {
       await invoke<PinnedResult | null>("set_result_pinned", {
         input: resultRankingInput(result),
@@ -3438,10 +3640,10 @@ function MainApp() {
         setSearchResults(response);
         setSelectedIndex(0);
       }
-      setActionMessage(`${pinned ? "已固定" : "已取消固定"}：${result.title}`);
+      setActionMessage(`${isMarkResult ? (pinned ? "已置顶" : "已取消置顶") : pinned ? "已固定" : "已取消固定"}：${result.title}`);
       clearError();
     } catch (error) {
-      showError("配置", `${pinned ? "固定" : "取消固定"}失败：${result.title}`, error);
+      showError("配置", `${actionLabel}失败：${result.title}`, error);
     }
   }
 
@@ -3516,14 +3718,117 @@ function MainApp() {
     }
   }
 
-  async function refreshTodoSearch(message: string) {
-    const response = await invokeSearchWithRecents(query);
+  async function refreshTodoSearch(message: string, searchQuery = query) {
+    const response = await invokeSearchWithRecents(searchQuery);
     if (response !== null) {
       setSearchResults(response);
       setSelectedIndex(0);
     }
     setActionMessage(message);
     clearError();
+  }
+
+  function openTodoDraftFromQuery(currentQuery: string): boolean {
+    const parsed = parseTodoNewQuery(currentQuery, toolMenuAlias);
+    if (!parsed) {
+      return false;
+    }
+    if (!parsed.text.trim()) {
+      showError("待办", "请输入待办内容，例如 /todo new 买牛奶 30m");
+      return true;
+    }
+
+    if (parsed.hasReminderTime) {
+      void saveTodoFromDraft(parsed);
+      return true;
+    }
+
+    setTodoDraft({
+      text: parsed.text,
+      preset: parsed.preset,
+      customDate: parsed.customDate,
+      customTime: parsed.customTime,
+      notice: null,
+      saving: false,
+    });
+    setSelectedIndex(0);
+    setContextSession(null);
+    setActionMessage("选择待办提醒时间");
+    clearError();
+    return true;
+  }
+
+  async function saveTodoFromDraft(draft: TodoNewDraft): Promise<boolean> {
+    const text = draft.text.trim();
+    const remindAt = todoReminderDate(draft.preset, draft.customDate, draft.customTime);
+    if (!text) {
+      showError("待办", "待办内容不能为空");
+      return false;
+    }
+    if (!remindAt || remindAt.getTime() <= Date.now() + 60_000) {
+      showError("待办", "提醒时间必须晚于当前时间");
+      return false;
+    }
+
+    setActionMessage("正在加入待办");
+    try {
+      await invoke<Todo>("save_todo", {
+        input: {
+          text,
+          sourceApp: null,
+          remindAt: remindAt.toISOString(),
+        },
+      });
+      setTodoDraft(null);
+      const nextQuery = `${toolMenuAlias || "/"}todo`;
+      setQuery(nextQuery);
+      await refreshTodoSearch(
+        `已加入待办，将于 ${formatTodoReminderTime(remindAt)} 提醒：${text}`,
+        nextQuery,
+      );
+      focusSearchInput();
+      return true;
+    } catch (error) {
+      showError("待办", "待办保存失败", error);
+      return false;
+    }
+  }
+
+  function cancelTodoDraft() {
+    setTodoDraft(null);
+    setActionMessage("已取消新建待办");
+    focusSearchInput();
+  }
+
+  async function saveTodoDraft() {
+    if (!todoDraft || todoDraft.saving) {
+      return;
+    }
+    const text = todoDraft.text.trim();
+    if (!text) {
+      setTodoDraft({ ...todoDraft, notice: "待办内容不能为空" });
+      return;
+    }
+
+    const remindAt = todoReminderDate(
+      todoDraft.preset,
+      todoDraft.customDate,
+      todoDraft.customTime,
+    );
+    if (!remindAt || remindAt.getTime() <= Date.now() + 60_000) {
+      setTodoDraft({ ...todoDraft, notice: "请选择晚于当前时间的提醒时间" });
+      return;
+    }
+
+    setTodoDraft({ ...todoDraft, saving: true, notice: null });
+    const saved = await saveTodoFromDraft({ ...todoDraft, text, hasReminderTime: true });
+    if (!saved) {
+      setTodoDraft({
+        ...todoDraft,
+        saving: false,
+        notice: "待办保存失败",
+      });
+    }
   }
 
   async function completeTodoResult(result: SearchResult) {
@@ -3627,6 +3932,7 @@ function MainApp() {
     setContextSession({ result, actions, filter: "" });
     setSelectedIndex(0);
     setActionMessage(`上下文菜单：${result.title}`);
+    focusSearchInput();
     clearError();
   }
 
@@ -3820,6 +4126,21 @@ function MainApp() {
         setContextSession(null);
         setSelectedIndex(0);
         setActionMessage("已返回搜索结果");
+        focusSearchInput();
+        return;
+      }
+    }
+
+    if (todoDraft) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void saveTodoDraft();
+        return;
+      }
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelTodoDraft();
         return;
       }
     }
@@ -3830,6 +4151,11 @@ function MainApp() {
       setSelectedIndex((current) =>
         stepSelectionIndex(current, displayResults.length, move),
       );
+      return;
+    }
+
+    if (event.key === "Enter" && openTodoDraftFromQuery(query)) {
+      event.preventDefault();
       return;
     }
 
@@ -3933,6 +4259,76 @@ function MainApp() {
           <div className="actionStatus" aria-live="polite">
             {actionMessage}
           </div>
+        ) : null}
+
+        {viewMode === "launcher" && !showSettings && todoDraft ? (
+          <section className="todoDraftPanel" aria-label="新建待办提醒">
+            <header className="selectionTodoHeader">
+              <span>
+                <strong>新建待办</strong>
+                <small>/todo new 内容 30m 会直接保存；没有时间时在这里选择</small>
+              </span>
+              <button type="button" onClick={cancelTodoDraft}>
+                取消
+              </button>
+            </header>
+            <input
+              className="todoDraftTextInput"
+              aria-label="待办内容"
+              value={todoDraft.text}
+              onChange={(event) =>
+                setTodoDraft({ ...todoDraft, text: event.target.value, notice: null })
+              }
+            />
+            <div className="selectionTodoPresets" role="group" aria-label="提醒时间">
+              {todoTimePresetOptions().map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  className={todoDraft.preset === option.id ? "active" : ""}
+                  onClick={() =>
+                    setTodoDraft({ ...todoDraft, preset: option.id, notice: null })
+                  }
+                >
+                  <strong>{option.label}</strong>
+                  <small>{option.detail}</small>
+                </button>
+              ))}
+            </div>
+            {todoDraft.preset === "custom" ? (
+              <div className="selectionTodoCustom">
+                <input
+                  aria-label="提醒日期"
+                  type="date"
+                  value={todoDraft.customDate}
+                  onChange={(event) =>
+                    setTodoDraft({ ...todoDraft, customDate: event.target.value, notice: null })
+                  }
+                />
+                <input
+                  aria-label="提醒时间"
+                  type="time"
+                  value={todoDraft.customTime}
+                  onChange={(event) =>
+                    setTodoDraft({ ...todoDraft, customTime: event.target.value, notice: null })
+                  }
+                />
+              </div>
+            ) : null}
+            <footer className="selectionTodoFooter">
+              <span className={todoDraft.notice ? "selectionInlineError" : ""}>
+                {todoDraft.notice ??
+                  todoDraftReminderPreview(
+                    todoDraft.preset,
+                    todoDraft.customDate,
+                    todoDraft.customTime,
+                  )}
+              </span>
+              <button type="button" onClick={saveTodoDraft} disabled={todoDraft.saving}>
+                {todoDraft.saving ? "加入中" : "加入待办"}
+              </button>
+            </footer>
+          </section>
         ) : null}
 
         {showSettings ? (
@@ -4075,89 +4471,53 @@ function MainApp() {
                     <strong>搜索设置</strong>
                     <small>选择参与搜索的来源，并调整结果排序权重</small>
                   </div>
-                  <div className="sourceToggles" aria-label="搜索源开关">
-                    <ToggleButton
-                      active={searchSources.apps}
-                      label={searchSourceLabels.apps}
-                      onClick={() => updateSearchSource("apps", !searchSources.apps)}
-                    />
-                    <ToggleButton
-                      active={searchSources.files}
-                      label={searchSourceLabels.files}
-                      onClick={() => updateSearchSource("files", !searchSources.files)}
-                    />
-                    <ToggleButton
-                      active={searchSources.calculator}
-                      label={searchSourceLabels.calculator}
-                      onClick={() => updateSearchSource("calculator", !searchSources.calculator)}
-                    />
-                    <ToggleButton
-                      active={searchSources.system}
-                      label={searchSourceLabels.system}
-                      onClick={() => updateSearchSource("system", !searchSources.system)}
-                    />
-                    <ToggleButton
-                      active={searchSources.ai}
-                      label="AI"
-                      onClick={() => updateSearchSource("ai", !searchSources.ai)}
-                    />
-                    <ToggleButton
-                      active={searchSources.phrase}
-                      label={searchSourceLabels.phrase}
-                      onClick={() => updateSearchSource("phrase", !searchSources.phrase)}
-                    />
-                    <ToggleButton
-                      active={searchSources.webSearch}
-                      label={searchSourceLabels.webSearch}
-                      onClick={() => updateSearchSource("webSearch", !searchSources.webSearch)}
-                    />
-                    <ToggleButton
-                      active={searchSources.tools}
-                      label={searchSourceLabels.tools}
-                      onClick={() => updateSearchSource("tools", !searchSources.tools)}
-                    />
-                  </div>
-                  <div className="weightToggles" aria-label="搜索权重">
-                    <WeightInput
-                      label={searchSourceLabels.apps}
-                      value={searchWeights.apps}
-                      onChange={(value) => updateSearchWeight("apps", value)}
-                    />
-                    <WeightInput
-                      label={searchSourceLabels.files}
-                      value={searchWeights.files}
-                      onChange={(value) => updateSearchWeight("files", value)}
-                    />
-                    <WeightInput
-                      label={searchSourceLabels.calculator}
-                      value={searchWeights.calculator}
-                      onChange={(value) => updateSearchWeight("calculator", value)}
-                    />
-                    <WeightInput
-                      label={searchSourceLabels.system}
-                      value={searchWeights.system}
-                      onChange={(value) => updateSearchWeight("system", value)}
-                    />
-                    <WeightInput
-                      label="AI"
-                      value={searchWeights.ai}
-                      onChange={(value) => updateSearchWeight("ai", value)}
-                    />
-                    <WeightInput
-                      label={searchSourceLabels.phrase}
-                      value={searchWeights.phrase}
-                      onChange={(value) => updateSearchWeight("phrase", value)}
-                    />
-                    <WeightInput
-                      label={searchSourceLabels.webSearch}
-                      value={searchWeights.webSearch}
-                      onChange={(value) => updateSearchWeight("webSearch", value)}
-                    />
-                    <WeightInput
-                      label={searchSourceLabels.tools}
-                      value={searchWeights.tools}
-                      onChange={(value) => updateSearchWeight("tools", value)}
-                    />
+                  <div className="settingsSubsection">
+                    <div className="settingsHeader compact">
+                      <strong>搜索来源</strong>
+                      <small>关闭后对应来源不参与普通搜索；Slash 直接入口不受影响</small>
+                    </div>
+                    <div className="sourceToggles" aria-label="搜索源开关">
+                      <ToggleButton
+                        active={searchSources.apps}
+                        label={searchSourceLabels.apps}
+                        onClick={() => updateSearchSource("apps", !searchSources.apps)}
+                      />
+                      <ToggleButton
+                        active={searchSources.files}
+                        label={searchSourceLabels.files}
+                        onClick={() => updateSearchSource("files", !searchSources.files)}
+                      />
+                      <ToggleButton
+                        active={searchSources.calculator}
+                        label={searchSourceLabels.calculator}
+                        onClick={() => updateSearchSource("calculator", !searchSources.calculator)}
+                      />
+                      <ToggleButton
+                        active={searchSources.system}
+                        label={searchSourceLabels.system}
+                        onClick={() => updateSearchSource("system", !searchSources.system)}
+                      />
+                      <ToggleButton
+                        active={searchSources.ai}
+                        label="AI"
+                        onClick={() => updateSearchSource("ai", !searchSources.ai)}
+                      />
+                      <ToggleButton
+                        active={searchSources.phrase}
+                        label={searchSourceLabels.phrase}
+                        onClick={() => updateSearchSource("phrase", !searchSources.phrase)}
+                      />
+                      <ToggleButton
+                        active={searchSources.webSearch}
+                        label={searchSourceLabels.webSearch}
+                        onClick={() => updateSearchSource("webSearch", !searchSources.webSearch)}
+                      />
+                      <ToggleButton
+                        active={searchSources.tools}
+                        label={searchSourceLabels.tools}
+                        onClick={() => updateSearchSource("tools", !searchSources.tools)}
+                      />
+                    </div>
                   </div>
                   <div className="settingsSubsection">
                     <div className="settingsHeader compact">
@@ -4195,6 +4555,54 @@ function MainApp() {
                     <small className="settingsHint">
                       固定结果和 alias 通过搜索结果右键菜单管理，不会被清空学习数据删除。
                     </small>
+                  </div>
+                  <div className="settingsSubsection">
+                    <div className="settingsHeader compact">
+                      <strong>权重微调</strong>
+                      <small>只有需要改变默认排序倾向时再调整；1.0 表示默认权重</small>
+                    </div>
+                    <div className="weightToggles" aria-label="搜索权重">
+                      <WeightInput
+                        label={searchSourceLabels.apps}
+                        value={searchWeights.apps}
+                        onChange={(value) => updateSearchWeight("apps", value)}
+                      />
+                      <WeightInput
+                        label={searchSourceLabels.files}
+                        value={searchWeights.files}
+                        onChange={(value) => updateSearchWeight("files", value)}
+                      />
+                      <WeightInput
+                        label={searchSourceLabels.calculator}
+                        value={searchWeights.calculator}
+                        onChange={(value) => updateSearchWeight("calculator", value)}
+                      />
+                      <WeightInput
+                        label={searchSourceLabels.system}
+                        value={searchWeights.system}
+                        onChange={(value) => updateSearchWeight("system", value)}
+                      />
+                      <WeightInput
+                        label="AI"
+                        value={searchWeights.ai}
+                        onChange={(value) => updateSearchWeight("ai", value)}
+                      />
+                      <WeightInput
+                        label={searchSourceLabels.phrase}
+                        value={searchWeights.phrase}
+                        onChange={(value) => updateSearchWeight("phrase", value)}
+                      />
+                      <WeightInput
+                        label={searchSourceLabels.webSearch}
+                        value={searchWeights.webSearch}
+                        onChange={(value) => updateSearchWeight("webSearch", value)}
+                      />
+                      <WeightInput
+                        label={searchSourceLabels.tools}
+                        value={searchWeights.tools}
+                        onChange={(value) => updateSearchWeight("tools", value)}
+                      />
+                    </div>
                   </div>
                   <div className="settingsSubsection">
                     <div className="settingsHeader compact">
@@ -4426,6 +4834,8 @@ function MainApp() {
                             (item) => item.visible,
                           ).length;
                           const cannotHide = setting.visible && visibleCount <= 1;
+                          const isFirst = index === 0;
+                          const isLast = index === slashBoardScopeSettings.length - 1;
 
                           return (
                             <div
@@ -4458,18 +4868,44 @@ function MainApp() {
                                 <span>{scope.label}</span>
                                 <small>{scope.subtitle}</small>
                               </label>
+                              <span className="slashBoardSettingsActions">
+                                <button
+                                  type="button"
+                                  aria-label={`${scope.label} 上移`}
+                                  title="上移"
+                                  disabled={isFirst}
+                                  onClick={() => moveSlashBoardScope(setting.id, "up")}
+                                >
+                                  ↑
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-label={`${scope.label} 下移`}
+                                  title="下移"
+                                  disabled={isLast}
+                                  onClick={() => moveSlashBoardScope(setting.id, "down")}
+                                >
+                                  ↓
+                                </button>
+                              </span>
                               <span
                                 className="slashBoardSettingsHandle"
                                 role="button"
                                 tabIndex={0}
-                                aria-label={`${scope.label} 拖拽排序`}
+                                aria-label={`${scope.label} 排序手柄`}
                                 onPointerDown={(event) =>
                                   handleSlashBoardScopePointerDown(event, setting.id)
                                 }
                                 onKeyDown={(event) => {
-                                  if (event.key === "Enter" || event.key === " ") {
+                                  const move = navMoveFromKey(event.key);
+                                  if (
+                                    move === "up" ||
+                                    move === "down" ||
+                                    move === "home" ||
+                                    move === "end"
+                                  ) {
                                     event.preventDefault();
-                                    setActionMessage("按住三横线并拖拽可调整顺序");
+                                    moveSlashBoardScope(setting.id, move);
                                   }
                                 }}
                               >
@@ -4945,7 +5381,22 @@ function MainApp() {
                   <div className="settingsSubsection">
                     <div className="settingsHeader compact">
                       <strong>划词记录</strong>
-                      <small>记录只通过 /mark 取回，不进入普通搜索，也不会写入配置导出</small>
+                      <small>记录只通过 /mark 取回，不进入普通搜索；右键记录可置顶</small>
+                    </div>
+                    <div className="settingRow shortcutRow">
+                      <span className="settingLabel">上限</span>
+                      <input
+                        type="number"
+                        min={SELECTION_MARK_LIMIT_MIN}
+                        max={SELECTION_MARK_LIMIT_MAX}
+                        step={50}
+                        value={selectionMarkLimitInput}
+                        onChange={(event) => setSelectionMarkLimitInput(event.target.value)}
+                        aria-label="划词记录数量上限"
+                      />
+                      <button type="button" onClick={saveSelectionMarkLimit}>
+                        保存
+                      </button>
                     </div>
                     <div className="sourceToggles" aria-label="划词记录操作">
                       <button
@@ -4956,12 +5407,15 @@ function MainApp() {
                         清空划词记录
                       </button>
                     </div>
+                    <small className="settingsHint">
+                      支持 {SELECTION_MARK_LIMIT_MIN}-{SELECTION_MARK_LIMIT_MAX} 条，默认 {SELECTION_MARK_LIMIT_DEFAULT} 条；降低上限会确认后按最久未使用记录立即裁剪，置顶记录不会进入配置导出。
+                    </small>
                   </div>
 
                   <div className="settingsSubsection">
                     <div className="settingsHeader compact">
                       <strong>待办提醒</strong>
-                      <small>待办只通过 /todo 管理；已完成项可定期清理</small>
+                      <small>待办通过 /todo 管理；/todo new 可从搜索框新建提醒</small>
                     </div>
                     <div className="sourceToggles" aria-label="待办提醒操作">
                       <button
@@ -4972,6 +5426,9 @@ function MainApp() {
                         清空已完成待办
                       </button>
                     </div>
+                    <small className="settingsHint">
+                      用法：/todo new 买牛奶 打开时间选择；/todo new 买牛奶 30m 会直接保存为 30 分钟后提醒。只有最后一个 10m、30m、2h、1d 这类时间 token 会被识别，中间出现的 30m 会保留在待办内容里。
+                    </small>
                   </div>
 
                   <div className="settingsSubsection">
@@ -5680,80 +6137,78 @@ function MainApp() {
                 </div>
                 <div className="aiConversationList">
                   {aiConversations.map((conversation) => (
-                    <div
-                      className={
-                        selectedAiConversation?.id === conversation.id
-                          ? "aiConversationItem active"
-                          : "aiConversationItem"
-                      }
-                      key={conversation.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => {
-                        if (renamingAiConversationId !== conversation.id) {
-                          selectAiConversation(conversation.id);
+                      <div
+                        className={
+                          selectedAiConversation?.id === conversation.id
+                            ? "aiConversationItem active"
+                            : "aiConversationItem"
                         }
-                      }}
-                      onKeyDown={(event) => {
-                        if (
-                          (event.key === "Enter" || event.key === " ") &&
-                          renamingAiConversationId !== conversation.id
-                        ) {
-                          event.preventDefault();
-                          selectAiConversation(conversation.id);
-                        }
-                      }}
-                    >
-                      <div className="aiConversationMain">
-                        {renamingAiConversationId === conversation.id ? (
-                          <input
-                            aria-label="会话标题"
-                            autoFocus
-                            value={renamingAiConversationTitle}
-                            onClick={(event) => event.stopPropagation()}
-                            onChange={(event) => setRenamingAiConversationTitle(event.target.value)}
-                            onBlur={saveAiConversationTitle}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter") {
-                                event.preventDefault();
-                                saveAiConversationTitle();
-                              }
-                              if (event.key === "Escape") {
-                                event.preventDefault();
-                                setRenamingAiConversationId(null);
-                              }
+                        key={conversation.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => {
+                          if (renamingAiConversationId !== conversation.id) {
+                            selectAiConversation(conversation.id);
+                          }
+                        }}
+                        onKeyDown={(event) => {
+                          if (
+                            (event.key === "Enter" || event.key === " ") &&
+                            renamingAiConversationId !== conversation.id
+                          ) {
+                            event.preventDefault();
+                            selectAiConversation(conversation.id);
+                          }
+                        }}
+                      >
+                        <div className="aiConversationMain">
+                          {renamingAiConversationId === conversation.id ? (
+                            <input
+                              aria-label="会话标题"
+                              autoFocus
+                              value={renamingAiConversationTitle}
+                              onClick={(event) => event.stopPropagation()}
+                              onChange={(event) => setRenamingAiConversationTitle(event.target.value)}
+                              onBlur={saveAiConversationTitle}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") {
+                                  event.preventDefault();
+                                  saveAiConversationTitle();
+                                }
+                                if (event.key === "Escape") {
+                                  event.preventDefault();
+                                  setRenamingAiConversationId(null);
+                                }
+                              }}
+                            />
+                          ) : (
+                            <strong>{conversation.title || "新会话"}</strong>
+                          )}
+                          <small>{formatDateTime(conversation.lastMessageAt ?? conversation.updatedAt)}</small>
+                        </div>
+                        <div className="aiConversationActions">
+                          <button
+                            className="miniAction"
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              startRenameAiConversation(conversation);
                             }}
-                          />
-                        ) : (
-                          <strong>
-                            {conversation.title || "新会话"}
-                          </strong>
-                        )}
-                        <small>{formatDateTime(conversation.lastMessageAt ?? conversation.updatedAt)}</small>
+                          >
+                            改名
+                          </button>
+                          <button
+                            className="miniAction"
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              deleteAiConversation(conversation.id);
+                            }}
+                          >
+                            删除
+                          </button>
+                        </div>
                       </div>
-                      <div className="aiConversationActions">
-                        <button
-                          className="miniAction"
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            startRenameAiConversation(conversation);
-                          }}
-                        >
-                          改名
-                        </button>
-                        <button
-                          className="miniAction"
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            deleteAiConversation(conversation.id);
-                          }}
-                        >
-                          删除
-                        </button>
-                      </div>
-                    </div>
                   ))}
                   {aiConversations.length === 0 ? (
                     <div className="aiConversationEmpty">
@@ -5766,34 +6221,96 @@ function MainApp() {
             ) : null}
             <section className="aiChatPane" aria-label="AI 聊天">
               <div className="aiChatHeader">
-                <strong>{selectedAiAssistant?.name ?? "默认助手"}</strong>
-                {selectedAiConversation ? (
-                  renamingAiConversationId === selectedAiConversation.id ? (
-                    <input
-                      aria-label="会话标题"
-                      autoFocus
-                      value={renamingAiConversationTitle}
-                      onChange={(event) => setRenamingAiConversationTitle(event.target.value)}
-                      onBlur={saveAiConversationTitle}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          saveAiConversationTitle();
-                        }
-                        if (event.key === "Escape") {
-                          event.preventDefault();
-                          setRenamingAiConversationId(null);
-                        }
-                      }}
-                    />
-                  ) : (
-                    <button type="button" onClick={() => startRenameAiConversation(selectedAiConversation)}>
-                      {selectedAiConversation.title || "新会话"}
-                    </button>
-                  )
-                ) : (
-                  <small>新会话</small>
-                )}
+                <span className="aiChatTitle">
+                  <strong>{selectedAiAssistant?.name ?? "默认助手"}</strong>
+                  <small>
+                    {selectedAiAssistant
+                      ? assistantModelSummary(
+                          selectedAiAssistant,
+                          aiModelProfiles,
+                          aiProviders,
+                          enabledAiProviderModels,
+                        )
+                      : "未选择助手"}
+                  </small>
+                </span>
+                <span className="aiChatHeaderActions">
+                  <label className="aiChatModelSelect providerSelect">
+                    <span>供应商</span>
+                    <select
+                      aria-label="聊天供应商"
+                      value={selectedChatProviderId}
+                      disabled={
+                        !selectedAiAssistant ||
+                        activeAiRequestId !== null ||
+                        chatModelProviders.length === 0
+                      }
+                      onChange={(event) => updateSelectedAiAssistantProvider(event.target.value)}
+                    >
+                      <option value="" disabled>
+                        未选择供应商
+                      </option>
+                      {chatModelProviders.map((provider) => (
+                        <option key={provider.id} value={provider.id}>
+                          {provider.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="aiChatModelSelect modelSelect">
+                    <span>模型</span>
+                    <select
+                      aria-label="聊天模型"
+                      value={selectedChatModelName}
+                      disabled={
+                        !selectedAiAssistant ||
+                        activeAiRequestId !== null ||
+                        selectedChatProviderModels.length === 0
+                      }
+                      onChange={(event) =>
+                        updateSelectedAiAssistantModel(selectedChatProviderId, event.target.value)
+                      }
+                    >
+                      <option value="" disabled>
+                        未选择模型
+                      </option>
+                      {selectedChatProviderModels.map((model) => (
+                        <option key={model.id} value={model.modelName}>
+                          {model.modelName}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <span className="aiChatConversationControl">
+                    {selectedAiConversation ? (
+                      renamingAiConversationId === selectedAiConversation.id ? (
+                        <input
+                          aria-label="会话标题"
+                          autoFocus
+                          value={renamingAiConversationTitle}
+                          onChange={(event) => setRenamingAiConversationTitle(event.target.value)}
+                          onBlur={saveAiConversationTitle}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              saveAiConversationTitle();
+                            }
+                            if (event.key === "Escape") {
+                              event.preventDefault();
+                              setRenamingAiConversationId(null);
+                            }
+                          }}
+                        />
+                      ) : (
+                        <button type="button" onClick={() => startRenameAiConversation(selectedAiConversation)}>
+                          {selectedAiConversation.title || "新会话"}
+                        </button>
+                      )
+                    ) : (
+                      <small>新会话</small>
+                    )}
+                  </span>
+                </span>
               </div>
               <div
                 className="aiMessageList"
@@ -5972,7 +6489,7 @@ function MainApp() {
           </div>
         ) : null}
 
-        {viewMode === "launcher" && !showSettings && !slashBoardActive && (contextSession || query.trim().length > 0) ? (
+        {viewMode === "launcher" && !showSettings && !todoDraft && !slashBoardActive && (contextSession || query.trim().length > 0) ? (
           <div className={contextSession ? "resultList contextResultList" : "resultList"}>
             {contextSession ? (
               <div className="contextHeader">
@@ -5986,13 +6503,18 @@ function MainApp() {
                     setContextSession(null);
                     setSelectedIndex(0);
                     setActionMessage("已返回搜索结果");
+                    focusSearchInput();
                   }}
                 >
                   返回
                 </button>
               </div>
             ) : null}
-            {displayResults.map((result, index) => (
+            {displayResults.map((result, index) => {
+              const isMarkResult = result.id.startsWith("mark:");
+              const markPinned = pinnedResults.some((item) => item.resultId === result.id);
+
+              return (
               <ResultRow
                 actions={
                   contextSession ? (
@@ -6000,6 +6522,22 @@ function MainApp() {
                   ) : (
                     <>
                       <span className="resultAction">{resultActionLabel(result)}</span>
+                      {isMarkResult ? (
+                        <button
+                          type="button"
+                          className={markPinned ? "resultPinButton active" : "resultPinButton"}
+                          aria-label={markPinned ? "取消置顶划词记录" : "置顶划词记录"}
+                          aria-pressed={markPinned}
+                          title={markPinned ? "取消置顶" : "置顶"}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setSelectedIndex(index);
+                            void setResultPinned(result, !markPinned);
+                          }}
+                        >
+                          {markPinned ? "已置顶" : "置顶"}
+                        </button>
+                      ) : null}
                       <button
                         type="button"
                         className="resultMoreButton"
@@ -6081,7 +6619,8 @@ function MainApp() {
                   <span className="fileMetaLine">{formatFileMetadata(result.fileMetadata)}</span>
                 ) : null}
               </ResultRow>
-            ))}
+              );
+            })}
 
             {displayResults.length === 0 ? <div className="emptyState">没有结果</div> : null}
           </div>
@@ -7695,6 +8234,22 @@ function integerFromInput(value: string, fallback: number): number {
   return Number.isFinite(parsed) ? Math.trunc(parsed) : fallback;
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeSelectionMarkLimit(value: string | null): number {
+  const parsed = value === null ? Number.NaN : Number(value.trim());
+  if (
+    Number.isInteger(parsed) &&
+    parsed >= SELECTION_MARK_LIMIT_MIN &&
+    parsed <= SELECTION_MARK_LIMIT_MAX
+  ) {
+    return Math.trunc(parsed);
+  }
+  return SELECTION_MARK_LIMIT_DEFAULT;
+}
+
 function assistantToDraft(assistant: AiAssistant): AiAssistantDraft {
   return {
     id: assistant.id,
@@ -7753,6 +8308,16 @@ function contextActionsForResult(
       subtitle: result.title,
     },
   ];
+
+  if (result.id.startsWith("mark:")) {
+    const pinned = pinnedResults.some((item) => item.resultId === result.id);
+    actions.push({
+      id: pinned ? "unpinResult" : "pinResult",
+      title: pinned ? "取消置顶" : "置顶",
+      subtitle: pinned ? "恢复为普通记录排序" : "固定在 /mark 顶部",
+    });
+    return actions;
+  }
 
   if (matchesRankableResult(result)) {
     const pinned = pinnedResults.some((item) => item.resultId === result.id);
@@ -8153,6 +8718,108 @@ function todoPresetOption(id: TodoTimePreset, label: string) {
     label,
     detail: date ? formatTodoReminderTime(date) : "选择日期时间",
   };
+}
+
+function parseTodoNewQuery(
+  query: string,
+  toolMenuAlias: string,
+): TodoNewDraft | null {
+  const trimmed = query.trim();
+  const aliases = Array.from(new Set(["/", toolMenuAlias || "/"]));
+
+  for (const alias of aliases) {
+    const prefixMatch = trimmed.match(
+      new RegExp(`^${escapeRegExp(alias)}todo(?:\\s+|$)`, "i"),
+    );
+    if (!prefixMatch) {
+      continue;
+    }
+
+    const rest = trimmed.slice(prefixMatch[0].length).trim();
+    const newMatch = rest.match(/^new(?:\s+([\s\S]*))?$/i);
+    if (!newMatch) {
+      return null;
+    }
+
+    const content = (newMatch[1] ?? "").trim();
+    return todoDraftFromContent(content);
+  }
+
+  return null;
+}
+
+function todoDraftFromContent(content: string): TodoNewDraft {
+  const tokens = content.split(/\s+/).filter(Boolean);
+  const trailingToken = tokens[tokens.length - 1] ?? "";
+  const trailingTime = todoTimeFromTrailingToken(trailingToken);
+  if (!trailingTime) {
+    return {
+      text: content,
+      preset: "custom",
+      customDate: "",
+      customTime: "",
+      hasReminderTime: false,
+    };
+  }
+
+  const text = content.slice(0, content.length - trailingToken.length).trim();
+  return {
+    text,
+    preset: trailingTime.preset,
+    customDate: trailingTime.customDate,
+    customTime: trailingTime.customTime,
+    hasReminderTime: true,
+  };
+}
+
+function todoTimeFromTrailingToken(
+  token: string,
+): Pick<TodoDraft, "preset" | "customDate" | "customTime"> | null {
+  const match = token.trim().match(/^(\d+)(m|h|d)$/i);
+  if (!match) {
+    return null;
+  }
+
+  const amount = Number(match[1]);
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    return null;
+  }
+
+  const unit = match[2].toLowerCase();
+  const minutes =
+    unit === "m" ? amount : unit === "h" ? amount * 60 : amount * 24 * 60;
+  if (!Number.isSafeInteger(minutes) || minutes <= 0) {
+    return null;
+  }
+
+  if (minutes === 10) {
+    return { preset: "10m", customDate: "", customTime: "" };
+  }
+  if (minutes === 30) {
+    return { preset: "30m", customDate: "", customTime: "" };
+  }
+  if (minutes === 60) {
+    return { preset: "1h", customDate: "", customTime: "" };
+  }
+
+  const customDate = new Date(Date.now() + minutes * 60_000);
+  return {
+    preset: "custom",
+    customDate: localDateInputValue(customDate),
+    customTime: localTimeInputValue(customDate),
+  };
+}
+
+function todoDraftReminderPreview(
+  preset: TodoTimePreset,
+  customDate: string,
+  customTime: string,
+): string {
+  const remindAt = todoReminderDate(preset, customDate, customTime);
+  if (!remindAt || remindAt.getTime() <= Date.now() + 60_000) {
+    return "请选择提醒时间";
+  }
+  return `将于 ${formatTodoReminderTime(remindAt)} 提醒`;
 }
 
 function todoReminderDate(

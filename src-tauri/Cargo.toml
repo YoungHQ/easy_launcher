@@ -1,6 +1,6 @@
 [package]
 name = "easy-launcher"
-version = "0.2.2"
+version = "0.2.3"
 description = "A Windows-first desktop launcher"
 authors = ["Easy Launcher Contributors"]
 edition = "2021"
@@ -34,3 +34,4 @@ pinyin = "0.11"
 willhook = "0.6.3"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_GdiPlus", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+

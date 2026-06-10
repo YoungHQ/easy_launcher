@@ -826,12 +826,33 @@ fn quick_entry_mark_results(query: &str, context: &SearchContext<'_>) -> Vec<Sea
 
     let query = normalize_query(query);
     let total = marks.len();
-    marks
+    let mut results = marks
         .iter()
         .enumerate()
         .filter(|(_, mark)| query.is_empty() || mark.text.to_lowercase().contains(&query))
-        .map(|(index, mark)| selection_mark_result(mark, total.saturating_sub(index)))
-        .collect()
+        .map(|(index, mark)| {
+            let mut result = selection_mark_result(mark, total.saturating_sub(index));
+            let pinned = pinned_score(context, &result);
+            if pinned > 0.0 {
+                result.score = pinned;
+            }
+            result
+        })
+        .collect::<Vec<_>>();
+    results.sort_by(|left, right| {
+        let left_pinned = pinned_score(context, left);
+        let right_pinned = pinned_score(context, right);
+        right_pinned
+            .partial_cmp(&left_pinned)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    results
 }
 
 fn quick_entry_todo_results(query: &str, context: &SearchContext<'_>) -> Vec<SearchResult> {
@@ -3773,6 +3794,7 @@ mod tests {
             text: text.into(),
             source_app: None,
             created_at: created_at.into(),
+            last_used_at: created_at.into(),
             use_count,
         }
     }
@@ -3978,6 +4000,38 @@ mod tests {
             .iter()
             .all(|result| matches!(result.action, ActionKind::CopyText)));
         assert_eq!(results[0].id, "mark:newer");
+    }
+
+    #[test]
+    fn quick_entry_mark_orders_pinned_marks_first() {
+        let marks = vec![
+            test_selection_mark("mark:older", "Older note", "2026-06-01T00:00:00.000Z", 0),
+            test_selection_mark("mark:newer", "Newer note", "2026-06-02T00:00:00.000Z", 2),
+        ];
+        let pinned_scores = HashMap::from([("mark:older".to_string(), 0.65)]);
+        let enabled_sources = HashSet::new();
+        let password_options = PasswordOptions::default();
+        let context = SearchContext {
+            recent_scores: None,
+            query_selection_scores: None,
+            pinned_scores: Some(&pinned_scores),
+            result_aliases: None,
+            custom_commands: Some(&[]),
+            phrases: Some(&[]),
+            selection_marks: Some(&marks),
+            todos: None,
+            web_search_templates: Some(&[]),
+            password_options: Some(&password_options),
+            exclusion_rules: None,
+            source_weights: None,
+            enabled_sources: &enabled_sources,
+            everything_options: None,
+        };
+        let route = parse_quick_entry_query("/mark", "/").expect("mark route");
+        let results = quick_entry_results(&route, &context);
+
+        assert_eq!(results[0].id, "mark:older");
+        assert_eq!(results[1].id, "mark:newer");
     }
 
     #[test]
